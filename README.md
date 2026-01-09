@@ -21,7 +21,7 @@ This tool fixes that. It reads the JSON metadata from Snapchat, embeds it direct
 - **Resume Support**: If the script crashes, it picks up exactly where it left off.
 - **4-Phase Architecture**: Extract → Download → Process → Upload (can run phases independently)
 
-## 🚀 Quick Start (Docker Compose)
+## 🐳 How to Run with Docker (Recommended)
 
 The easiest way to run this is as a "sidecar" to your existing Immich installation.
 
@@ -41,7 +41,7 @@ services:
   # ... your existing immich services ...
 
   snapchat-importer:
-    image: yourusername/immich-snapchat-importer:latest
+    image: multekedir/immich-snapchat-importer:latest
     container_name: immich_snapchat_importer
     restart: on-failure
     volumes:
@@ -49,9 +49,16 @@ services:
       - ./snapchat-data:/data
     environment:
       - IMMICH_URL=http://immich-server:2283/api
-      - IMMICH_API_KEY=your_immich_api_key_here
-      - INPUT_FILE=/data/memories_history.json
+      - IMMICH_API_KEY=your_api_key_here
+    # Run the command pointing to the file inside the container
+    command: /data/memories_history.json
 ```
+
+**Important Notes:**
+- Replace `immich-server` with your actual Immich service name (usually `immich-server` or `immich`)
+- Replace `your_api_key_here` with your actual Immich API key
+- The script will automatically detect the environment variables and upload to Immich
+- If you want to use a different file name, update the `command` line accordingly
 
 ### 3. Run It
 
@@ -62,7 +69,15 @@ docker compose logs -f snapchat-importer
 
 The container will start, process your memories, upload them to Immich, and then stop automatically when finished.
 
-**Note**: The Docker image is not yet available. You'll need to build it yourself or wait for it to be published. For now, use the manual installation method below.
+**Note**: If the Docker image is not yet published, you can build it locally:
+
+```bash
+git clone https://github.com/multekedir/immich-snapchat-importer.git
+cd immich-snapchat-importer
+docker build -t multekedir/immich-snapchat-importer:latest .
+```
+
+Then use `image: multekedir/immich-snapchat-importer:latest` in your docker-compose.yml.
 
 ## 🛠️ Manual / Standalone Usage
 
