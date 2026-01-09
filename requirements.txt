@@ -1,0 +1,6 @@
+opencv-python
+Pillow
+piexif
+numpy
+requests
+
