@@ -20,157 +20,203 @@ This tool fixes that. It reads the JSON metadata from Snapchat, embeds it direct
 - **Memory Efficient**: Downloads, processes, and uploads files in batches.
 - **Resume Support**: If the script crashes, it picks up exactly where it left off.
 - **4-Phase Architecture**: Extract → Download → Process → Upload (can run phases independently)
+- **🆕 Web Interface**: User-friendly web UI with real-time progress tracking
 
-## 🐳 How to Run with Docker (Recommended)
+## 🚀 Quick Start
 
-The easiest way to run this is as a "sidecar" to your existing Immich installation.
+> **New to this tool?** Check out the [Quick Start Guide](QUICKSTART.md) for a 5-minute setup!
 
-### 1. Prepare your Data
+You have two options to run this tool:
 
-1. Request your data from Snapchat (Settings -> My Data).
-2. Download the ZIP file and extract it.
-3. Locate `json/memories_history.json` inside the extracted folder.
-4. Create a folder named `snapchat-data` on your server and move the `.json` file there.
+### Option 1: Web Interface (Recommended) 🌐
 
-### 2. Update Docker Compose
+The easiest way with a beautiful web UI and real-time progress tracking.
 
-Add this service to your existing `docker-compose.yml` file:
+```bash
+# 1. Clone the repository
+git clone https://github.com/yourusername/immich-snapchat-importer.git
+cd immich-snapchat-importer
+
+# 2. Copy environment file and configure
+cp .env.example .env
+# Edit .env with your Immich URL and API key
+
+# 3. Start the web interface
+# If your Docker Compose supports profiles (v1.28+):
+docker compose --profile web up -d
+# Or use separate compose file (works with older versions):
+docker-compose -f docker-compose.web.yml up -d
+
+# 4. Open your browser
+# Navigate to http://localhost:8000
+```
+
+The web interface provides:
+- 📁 Drag & drop file upload
+- ⚙️ Easy configuration
+- 📊 Real-time progress tracking
+- 📈 Import statistics dashboard
+- 🔄 WebSocket-based live updates
+
+### Option 2: Command Line (Advanced) ⌨️
+
+For automated workflows or headless servers.
+
+```bash
+# 1. Prepare your data
+# Place memories_history.json in ./snapchat-data/
+
+# 2. Configure environment
+cp .env.example .env
+# Edit .env with your settings
+
+# 3. Run the CLI import
+# If your Docker Compose supports profiles (v1.28+):
+docker compose --profile cli up
+# Or use separate compose file (works with older versions):
+docker-compose -f docker-compose.cli.yml up
+
+# Monitor logs
+docker compose logs -f snapchat-importer-cli
+```
+
+## 📋 Prerequisites
+
+### For Web Interface
+- Docker and Docker Compose
+- Immich server running
+- Port 8000 available (or change in docker-compose.yml)
+
+### For CLI Mode
+- Docker and Docker Compose
+- Snapchat export file (memories_history.json or memories_history.html)
+
+### Getting Your Snapchat Export
+
+1. Open Snapchat → Settings → My Data
+2. Click "Submit Request"
+3. Wait for email (usually 24-48 hours)
+4. Download ZIP file
+5. Extract and locate `json/memories_history.json`
+
+### Getting Your Immich API Key
+
+1. Open Immich in your browser
+2. Go to **Account Settings** → **API Keys**
+3. Click **Create API Key**
+4. Copy the key (you won't see it again!)
+5. Add to `.env` file or enter in web interface
+
+## 🐳 Docker Deployment
+
+### Web Interface with Immich
+
+Add to your existing `docker-compose.yml`:
 
 ```yaml
 services:
   # ... your existing immich services ...
 
   snapchat-importer:
-    image: multekedir/immich-snapchat-importer:latest
+    image: yourusername/immich-snapchat-importer:web
     container_name: immich_snapchat_importer
-    restart: on-failure
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
     volumes:
-      # Link to the folder where you put memories_history.json
-      - ./snapchat-data:/data
+      - ./snapchat-data:/app/uploads
+      - ./snapchat-work:/app/work
     environment:
       - IMMICH_URL=http://immich-server:2283/api
-      - IMMICH_API_KEY=your_api_key_here
-    # Run the command pointing to the file inside the container
-    command: /data/memories_history.json
+      - IMMICH_API_KEY=${IMMICH_API_KEY}
+    networks:
+      - default  # Use same network as Immich
 ```
 
-**Important Notes:**
-- Replace `immich-server` with your actual Immich service name (usually `immich-server` or `immich`)
-- Replace `your_api_key_here` with your actual Immich API key
-- The script will automatically detect the environment variables and upload to Immich
-- If you want to use a different file name, update the `command` line accordingly
+Then access the web UI at `http://your-server:8000`
 
-### 3. Run It
+### Standalone Docker Run
 
 ```bash
-docker compose up -d snapchat-importer
-docker compose logs -f snapchat-importer
+docker run -d \
+  --name snapchat-importer \
+  -p 8000:8000 \
+  -v $(pwd)/snapchat-data:/app/uploads \
+  -v $(pwd)/snapchat-work:/app/work \
+  -e IMMICH_URL=http://your-immich:2283/api \
+  -e IMMICH_API_KEY=your_key \
+  yourusername/immich-snapchat-importer:web
 ```
 
-The container will start, process your memories, upload them to Immich, and then stop automatically when finished.
-
-**Note**: If the Docker image is not yet published, you can build it locally:
-
-```bash
-git clone https://github.com/multekedir/immich-snapchat-importer.git
-cd immich-snapchat-importer
-docker build -t multekedir/immich-snapchat-importer:latest .
-```
-
-Then use `image: multekedir/immich-snapchat-importer:latest` in your docker-compose.yml.
-
-## 🛠️ Manual / Standalone Usage
-
-If you prefer to run it on your laptop (Mac/Windows/Linux) without Docker:
+## 🛠️ Manual Installation (Without Docker)
 
 ### Prerequisites
 
 - Python 3.10+
-- ffmpeg (Installed and in your system PATH)
+- ffmpeg (must be in system PATH)
 
 ### Installation
 
 ```bash
-git clone https://github.com/multekedir/immich-snapchat-importer.git
+# Clone repository
+git clone https://github.com/yourusername/immich-snapchat-importer.git
 cd immich-snapchat-importer
+
+# Install dependencies
 pip install -r requirements.txt
+
+# Install ffmpeg
+# macOS: brew install ffmpeg
+# Ubuntu: sudo apt install ffmpeg
+# Windows: Download from ffmpeg.org
 ```
 
-**Note**: Make sure `ffmpeg` is installed on your system:
-- **macOS**: `brew install ffmpeg`
-- **Ubuntu/Debian**: `sudo apt install ffmpeg`
-- **Windows**: Download from [ffmpeg.org](https://ffmpeg.org/download.html) and add to PATH
-
-### Usage
-
-The tool runs in 4 phases. You can run them all at once, or separately:
-
-#### Phase 1: Extract Metadata (Dry Run)
+### Running Web Interface
 
 ```bash
-# Extract metadata from JSON file (no download/processing)
-python process_memories.py memories_history.json --dry-run
+# Start the web server
+python webapp.py
 
-# Or from HTML file
-python process_memories.py memories_history.html --dry-run
+# Access at http://localhost:8000
 ```
 
-This creates a `*_metadata.json` file with all extracted metadata. Useful for previewing what will be imported.
-
-#### Phase 2-4: Full Import (Download + Process + Upload)
+### Running CLI
 
 ```bash
-# Full import with automatic upload to Immich
+# Full import with Immich upload
 python process_memories.py memories_history.json \
   --immich-url "http://192.168.1.100:2283/api" \
   --api-key "your_key_here"
 
-# Using environment variables (more secure)
-export IMMICH_URL="http://localhost:2283/api"
-export IMMICH_API_KEY="your_key_here"
-python process_memories.py memories_history.json
+# Dry run (extract metadata only)
+python process_memories.py memories_history.json --dry-run
 
-# With custom download delay (slower, but safer)
-python process_memories.py memories_history.json \
-  --immich-url "http://localhost:2283/api" \
-  --api-key "your_key_here" \
-  --delay 3
-```
-
-#### Process-Only Mode (Skip Download)
-
-If you've already downloaded files but want to reprocess or upload:
-
-```bash
-# Process existing downloads and upload to Immich
+# Process-only mode (skip download)
 python process_memories.py --process-only memories_history.json \
   --immich-url "http://localhost:2283/api" \
   --api-key "your_key_here"
 ```
 
-#### How It Works
-
-1. **Phase 1: Extract** - Parses JSON/HTML and extracts metadata (dates, GPS, URLs)
-2. **Phase 2: Download** - Downloads all media files from Snapchat servers
-3. **Phase 3: Process** - Extracts .bin files, applies overlays, embeds EXIF/GPS metadata
-4. **Phase 4: Upload** - Uploads processed files to Immich with correct dates
-
-## ⚙️ Configuration Options
+## ⚙️ Configuration
 
 Configuration can be set via three methods (in priority order):
 
-1. **Command-line arguments** (highest priority)
-2. **Environment variables**
-3. **`config.yaml` file** (lowest priority)
+### 1. Web Interface (Easiest)
+- Configure via the web UI form
+- Settings saved per-import
 
-### Configuration File
+### 2. Environment Variables
+```bash
+export IMMICH_URL="http://localhost:2283/api"
+export IMMICH_API_KEY="your_key_here"
+export DELAY="2.0"
+```
 
-Create a `config.yaml` file in the project root:
-
+### 3. Config File (`config.yaml`)
 ```yaml
 immich:
   url: http://immich-server:2283/api
-  api_key: ${IMMICH_API_KEY}  # Supports environment variable substitution
+  api_key: ${IMMICH_API_KEY}  # Supports env var substitution
 download:
   delay: 2.0
   max_retries: 3
@@ -180,59 +226,206 @@ processing:
   shadow_offset: 2
 ```
 
-**Note**: Use `${VARIABLE_NAME}` syntax to reference environment variables in the config file.
+### Configuration Options
 
-### Configuration Options Table
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `IMMICH_URL` | Immich API endpoint | None |
+| `IMMICH_API_KEY` | Immich API key | None |
+| `DELAY` | Seconds between downloads | 2.0 |
 
-| Environment Variable | CLI Argument | Config File | Description | Default |
-|---------------------|--------------|-------------|-------------|---------|
-| `IMMICH_URL` | `--immich-url` | `immich.url` | Your Immich Server API URL | None |
-| `IMMICH_API_KEY` | `--api-key` | `immich.api_key` | Your API Key (Create in Immich: Account Settings → API Keys) | None |
-| `DELAY` | `--delay` | `download.delay` | Seconds to wait between downloads (avoids rate limiting) | 2.0 |
+## 📊 Web Interface Features
 
-**Note**: If Immich URL and API key are not provided, the tool will skip the upload phase and only process files locally.
+### Dashboard
+- Real-time progress bars
+- Phase-by-phase status updates
+- Live statistics display
+- Import history
 
-### Getting Your Immich API Key
+### Upload Page
+- Drag & drop file upload
+- Automatic validation
+- File size preview
+- Support for JSON and HTML formats
 
-1. Open Immich in your browser
-2. Go to **Account Settings** → **API Keys**
-3. Click **Create API Key**
-4. Copy the key (you won't see it again!)
-5. Use it with `--api-key` or set `IMMICH_API_KEY` environment variable
+### Configuration
+- Form-based settings
+- API key masking
+- Skip upload option
+- Custom delay configuration
+
+### Progress Tracking
+- WebSocket-based live updates
+- Detailed phase information
+- Error notifications
+- Completion statistics
+
+## 🔧 How It Works
+
+### 4-Phase Architecture
+
+1. **Phase 1: Extract Metadata**
+   - Parses JSON/HTML export
+   - Extracts dates, GPS, URLs
+   - Saves to standardized JSON
+
+2. **Phase 2: Download Files**
+   - Downloads from Snapchat servers
+   - Retry logic with exponential backoff
+   - Resume support via progress tracking
+
+3. **Phase 3: Process Files**
+   - Extracts .bin archives (ZIP files)
+   - Applies overlay images/text
+   - Embeds EXIF/GPS metadata
+
+4. **Phase 4: Upload to Immich**
+   - Uploads with correct timestamps
+   - Duplicate detection
+   - Batch processing
 
 ## 🐛 Troubleshooting
 
+### Web Interface Issues
+
+**"Port 8000 already in use"**
+- Change port in docker-compose.yml: `- "8001:8000"`
+- Or stop the conflicting service
+
+**"Cannot connect to WebSocket"**
+- Check browser console for errors
+- Verify port 8000 is accessible
+- Check firewall settings
+
+**"Import stuck at X%"**
+- Check docker logs: `docker compose logs snapchat-importer-web`
+- Verify Immich is accessible from container
+- Check network connectivity
+
+### Common Issues
+
 **"Videos are missing audio after processing"**
-- Ensure ffmpeg is installed correctly: `ffmpeg -version`
-- The tool uses a complex ffmpeg filter to merge audio from the original file while burning the visual overlay.
-- If audio is still missing, check the original .bin file - some Snapchat videos may not have audio tracks.
+- Ensure ffmpeg is installed: `ffmpeg -version`
+- Check logs for ffmpeg errors
+- Some Snapchat videos may not have audio tracks
 
 **"Uploads failed with Error 409"**
-- This means the file already exists in Immich. The tool automatically skips these to prevent duplicates.
-- This is normal if you re-run the script - it won't re-upload existing files.
+- File already exists in Immich (duplicate)
+- This is normal - duplicates are skipped automatically
 
 **"Connection failed" or "Upload timeout"**
-- Check that your Immich URL is correct (should end with `/api`)
-- Verify your API key is valid and not expired
-- For large video files, uploads may take longer - the timeout is set to 120 seconds
-- Check your network connection to the Immich server
+- Verify Immich URL is correct (should end with `/api`)
+- Check API key is valid
+- For large videos, timeout is 120 seconds
+- Verify network connection to Immich
 
 **"GPS shows 0.0, 0.0"**
-- If Snapchat didn't record a valid GPS location for a memory, the tool preserves the timestamp but leaves the location blank (rather than placing you in the middle of the Atlantic Ocean).
-- This is expected behavior - not all Snapchat memories have GPS data.
+- Some Snapchat memories don't have GPS data
+- This is expected - coordinates are skipped if invalid
 
-**"No metadata found" during processing**
-- The tool uses multiple fallback strategies to match files to metadata
-- If you see this warning, the file will still be processed but without date/GPS metadata
-- Check that your `*_metadata.json` file exists and contains the expected memory entries
+**"No metadata found" during processing"**
+- Check that `*_metadata.json` file exists
+- Multiple fallback strategies are used
+- File will still be processed without metadata
 
 **"Download failed" errors**
-- Snapchat may rate-limit downloads. Increase the `--delay` value (e.g., `--delay 5`)
-- Some URLs may expire. Re-request your data from Snapchat if many downloads fail
-- Check your internet connection
+- Snapchat may rate-limit - increase `--delay` (e.g., `--delay 5`)
+- Some URLs may expire - re-request data from Snapchat
+- Check internet connection
+
+### Docker Issues
+
+**"Cannot access Immich from container"**
+```bash
+# Verify network connectivity
+docker compose exec snapchat-importer-web ping immich-server
+
+# Check if using correct network
+docker network ls
+docker network inspect immich_default
+```
+
+**"Volume permissions error"**
+```bash
+# Fix permissions
+sudo chown -R 1000:1000 ./snapchat-data ./snapchat-work
+```
+
+## 📜 API Documentation
+
+The web interface exposes a REST API:
+
+### Endpoints
+
+**POST `/api/upload`**
+- Upload Snapchat export file
+- Returns: `{status, filename, size, path}`
+
+**POST `/api/import/start`**
+- Start import job
+- Body: `{filename, config}`
+- Returns: `{job_id, status}`
+
+**GET `/api/import/status/{job_id}`**
+- Get import job status
+- Returns: Job details with progress
+
+**GET `/api/import/list`**
+- List all import jobs
+- Returns: Array of job objects
+
+**GET `/api/config`**
+- Get current configuration
+- Returns: Configuration object
+
+**GET `/health`**
+- Health check
+- Returns: `{status, active_imports, connected_clients}`
+
+**WebSocket `/ws`**
+- Real-time progress updates
+- Receives: `{type, job_id, progress, message, stats}`
+
+## 🔐 Security Notes
+
+- API keys are masked in config endpoint responses
+- Use environment variables for sensitive data
+- Web interface should run behind reverse proxy in production
+- Consider using HTTPS for remote access
+
+## 📈 Performance Tips
+
+1. **Adjust Download Delay**: Lower for fast connections (1.0s), higher if rate-limited (5.0s)
+2. **Batch Processing**: Process 50-100 files at a time for optimal performance
+3. **Network**: Run on same network as Immich for faster uploads
+4. **Storage**: Ensure sufficient disk space (2-3x export size)
+
+## 🤝 Contributing
+
+Contributions are welcome! Please:
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Submit a pull request
 
 ## 📜 License
 
 MIT License - Free to use and modify.
 
 **Disclaimer**: This project is not affiliated with Snapchat or Immich. Use at your own risk. Always backup your `memories_history.json` before starting.
+
+## 🙏 Acknowledgments
+
+- Immich team for the excellent photo management system
+- OpenCV, FFmpeg, and PIL/Pillow communities
+- FastAPI for the excellent web framework
+
+## 🆘 Support
+
+- Issues: [GitHub Issues](https://github.com/yourusername/immich-snapchat-importer/issues)
+- Discussions: [GitHub Discussions](https://github.com/yourusername/immich-snapchat-importer/discussions)
+
+---
+
+Made with ❤️ for the Immich community

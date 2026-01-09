@@ -1,0 +1,936 @@
+#!/usr/bin/env python3
+"""
+FastAPI Web Interface for Immich Snapchat Importer
+Provides a user-friendly web UI for configuring and running imports
+"""
+
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from typing import Optional, List
+import asyncio
+import json
+import logging
+import os
+import shutil
+from pathlib import Path
+from datetime import datetime
+import uvicorn
+
+# Import our processing modules
+from process_memories import (
+    extract_metadata_from_json,
+    extract_metadata_from_html,
+    MemoryDownloader,
+    MemoryProcessor,
+    upload_to_immich,
+    generate_report,
+    load_config
+)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Create FastAPI app
+app = FastAPI(
+    title="Immich Snapchat Importer",
+    description="Import Snapchat Memories to Immich with metadata preservation",
+    version="2.0.0"
+)
+
+# Global state management
+class ImportState:
+    def __init__(self):
+        self.active_imports = {}  # job_id -> import_info
+        self.websocket_clients = []  # Active WebSocket connections
+    
+    def add_import(self, job_id: str, info: dict):
+        self.active_imports[job_id] = info
+    
+    def update_import(self, job_id: str, updates: dict):
+        if job_id in self.active_imports:
+            self.active_imports[job_id].update(updates)
+    
+    def get_import(self, job_id: str):
+        return self.active_imports.get(job_id)
+    
+    async def broadcast(self, message: dict):
+        """Send message to all connected WebSocket clients"""
+        disconnected = []
+        for ws in self.websocket_clients:
+            try:
+                await ws.send_json(message)
+            except:
+                disconnected.append(ws)
+        
+        # Clean up disconnected clients
+        for ws in disconnected:
+            self.websocket_clients.remove(ws)
+
+state = ImportState()
+
+# Data models
+class ImportConfig(BaseModel):
+    immich_url: Optional[str] = None
+    api_key: Optional[str] = None
+    delay: float = 2.0
+    skip_upload: bool = False
+
+class ImportStatus(BaseModel):
+    job_id: str
+    status: str  # 'queued', 'extracting', 'downloading', 'processing', 'uploading', 'complete', 'failed'
+    progress: int  # 0-100
+    current_phase: str
+    message: str
+    stats: Optional[dict] = None
+
+# Ensure directories exist
+UPLOAD_DIR = Path("./uploads")
+WORK_DIR = Path("./work")
+UPLOAD_DIR.mkdir(exist_ok=True)
+WORK_DIR.mkdir(exist_ok=True)
+
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    """Serve the main web interface"""
+    return HTMLResponse(content=get_main_html(), status_code=200)
+
+@app.post("/api/upload")
+async def upload_file(file: UploadFile = File(...)):
+    """Upload Snapchat export file (JSON or HTML)"""
+    try:
+        # Validate file type
+        if not (file.filename.endswith('.json') or file.filename.endswith('.html')):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid file type. Please upload a .json or .html file"
+            )
+        
+        # Save uploaded file
+        file_path = UPLOAD_DIR / file.filename
+        with open(file_path, 'wb') as f:
+            content = await file.read()
+            f.write(content)
+        
+        logger.info(f"Uploaded file: {file.filename} ({len(content)} bytes)")
+        
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "size": len(content),
+            "path": str(file_path)
+        }
+    
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+class ImportRequest(BaseModel):
+    filename: str
+    config: ImportConfig
+
+@app.post("/api/import/start")
+async def start_import(
+    request: ImportRequest,
+    background_tasks: BackgroundTasks
+):
+    """Start a new import job"""
+    try:
+        # Validate file exists
+        input_file = UPLOAD_DIR / request.filename
+        if not input_file.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        
+        # Generate job ID
+        job_id = f"import_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        # Create job info
+        job_info = {
+            "job_id": job_id,
+            "filename": request.filename,
+            "status": "queued",
+            "progress": 0,
+            "current_phase": "Initializing",
+            "message": "Import job created",
+            "started_at": datetime.now().isoformat(),
+            "config": request.config.dict()
+        }
+        
+        state.add_import(job_id, job_info)
+        
+        # Start background task
+        background_tasks.add_task(
+            run_import_job,
+            job_id,
+            str(input_file),
+            request.config
+        )
+        
+        return {"job_id": job_id, "status": "queued"}
+    
+    except Exception as e:
+        logger.error(f"Failed to start import: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def run_import_job(job_id: str, input_file: str, config: ImportConfig):
+    """Background task to run the import process"""
+    try:
+        # Update status
+        state.update_import(job_id, {
+            "status": "extracting",
+            "current_phase": "Extracting Metadata",
+            "progress": 10
+        })
+        await state.broadcast({
+            "type": "progress",
+            "job_id": job_id,
+            "status": "extracting",
+            "progress": 10,
+            "message": "Extracting metadata from Snapchat export..."
+        })
+        
+        # Determine base name and extract function
+        input_path = Path(input_file)
+        base_name = input_path.stem
+        
+        if input_file.endswith('.json'):
+            extract_function = extract_metadata_from_json
+        else:
+            extract_function = extract_metadata_from_html
+        
+        # Setup paths
+        metadata_json = WORK_DIR / f"{base_name}_metadata.json"
+        download_folder = WORK_DIR / f"{base_name}_downloads"
+        output_folder = WORK_DIR / f"{base_name}_processed"
+        
+        # Phase 1: Extract metadata
+        metadata = extract_function(input_file, str(metadata_json))
+        if not metadata:
+            raise Exception("Failed to extract metadata")
+        
+        state.update_import(job_id, {
+            "progress": 20,
+            "message": f"Found {metadata['total_memories']} memories"
+        })
+        await state.broadcast({
+            "type": "progress",
+            "job_id": job_id,
+            "progress": 20,
+            "message": f"Found {metadata['total_memories']} memories"
+        })
+        
+        # Phase 2: Download files
+        state.update_import(job_id, {
+            "status": "downloading",
+            "current_phase": "Downloading Files",
+            "progress": 25
+        })
+        await state.broadcast({
+            "type": "progress",
+            "job_id": job_id,
+            "status": "downloading",
+            "progress": 25,
+            "message": "Downloading files from Snapchat..."
+        })
+        
+        downloader = MemoryDownloader(metadata, str(download_folder), config.delay)
+        success_count, failed_count = downloader.download_all()
+        
+        if success_count == 0:
+            raise Exception("No files downloaded successfully")
+        
+        state.update_import(job_id, {
+            "progress": 50,
+            "message": f"Downloaded {success_count} files"
+        })
+        await state.broadcast({
+            "type": "progress",
+            "job_id": job_id,
+            "progress": 50,
+            "message": f"Downloaded {success_count} files"
+        })
+        
+        # Phase 3: Process files
+        state.update_import(job_id, {
+            "status": "processing",
+            "current_phase": "Processing & Applying Metadata",
+            "progress": 55
+        })
+        await state.broadcast({
+            "type": "progress",
+            "job_id": job_id,
+            "status": "processing",
+            "progress": 55,
+            "message": "Processing files and applying metadata..."
+        })
+        
+        processor = MemoryProcessor(str(metadata_json), str(download_folder), str(output_folder))
+        processor.process_all()
+        
+        state.update_import(job_id, {
+            "progress": 75,
+            "message": "Files processed successfully"
+        })
+        await state.broadcast({
+            "type": "progress",
+            "job_id": job_id,
+            "progress": 75,
+            "message": "Files processed successfully"
+        })
+        
+        # Generate report
+        report = generate_report(str(metadata_json), str(output_folder))
+        
+        # Phase 4: Upload to Immich (if configured)
+        if not config.skip_upload and config.immich_url and config.api_key:
+            state.update_import(job_id, {
+                "status": "uploading",
+                "current_phase": "Uploading to Immich",
+                "progress": 80
+            })
+            await state.broadcast({
+                "type": "progress",
+                "job_id": job_id,
+                "status": "uploading",
+                "progress": 80,
+                "message": "Uploading to Immich..."
+            })
+            
+            upload_success, upload_failed, upload_skipped = upload_to_immich(
+                str(output_folder),
+                str(metadata_json),
+                config.immich_url,
+                config.api_key
+            )
+            
+            state.update_import(job_id, {
+                "progress": 95,
+                "message": f"Uploaded {upload_success} files to Immich"
+            })
+            await state.broadcast({
+                "type": "progress",
+                "job_id": job_id,
+                "progress": 95,
+                "message": f"Uploaded {upload_success} files"
+            })
+        
+        # Complete
+        state.update_import(job_id, {
+            "status": "complete",
+            "current_phase": "Complete",
+            "progress": 100,
+            "message": "Import completed successfully",
+            "completed_at": datetime.now().isoformat(),
+            "stats": report if report else {}
+        })
+        await state.broadcast({
+            "type": "complete",
+            "job_id": job_id,
+            "progress": 100,
+            "message": "Import completed successfully!",
+            "stats": report if report else {}
+        })
+    
+    except Exception as e:
+        logger.error(f"Import job {job_id} failed: {e}")
+        state.update_import(job_id, {
+            "status": "failed",
+            "current_phase": "Failed",
+            "message": str(e),
+            "failed_at": datetime.now().isoformat()
+        })
+        await state.broadcast({
+            "type": "error",
+            "job_id": job_id,
+            "message": f"Import failed: {str(e)}"
+        })
+
+@app.get("/api/import/status/{job_id}")
+async def get_import_status(job_id: str):
+    """Get status of an import job"""
+    job_info = state.get_import(job_id)
+    if not job_info:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    return job_info
+
+@app.get("/api/import/list")
+async def list_imports():
+    """List all import jobs"""
+    return {"imports": list(state.active_imports.values())}
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time updates"""
+    await websocket.accept()
+    state.websocket_clients.append(websocket)
+    
+    try:
+        while True:
+            # Keep connection alive
+            data = await websocket.receive_text()
+            # Echo back for heartbeat
+            await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        state.websocket_clients.remove(websocket)
+
+@app.get("/api/config")
+async def get_config():
+    """Get current configuration"""
+    config = load_config()
+    # Mask API key for security
+    if config.get('immich', {}).get('api_key'):
+        key = config['immich']['api_key']
+        config['immich']['api_key'] = f"{'*' * (len(key) - 4)}{key[-4:]}" if len(key) > 4 else "***"
+    
+    return config
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "active_imports": len(state.active_imports),
+        "connected_clients": len(state.websocket_clients)
+    }
+
+def get_main_html():
+    """Return the main HTML interface"""
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Immich Snapchat Importer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 28px;
+            margin-bottom: 8px;
+        }
+        
+        .header p {
+            opacity: 0.9;
+            font-size: 14px;
+        }
+        
+        .content {
+            padding: 30px;
+        }
+        
+        .section {
+            margin-bottom: 30px;
+        }
+        
+        .section-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 15px;
+            color: #333;
+        }
+        
+        .upload-area {
+            border: 2px dashed #667eea;
+            border-radius: 12px;
+            padding: 40px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .upload-area:hover {
+            border-color: #764ba2;
+            background: #f8f9ff;
+        }
+        
+        .upload-area.dragging {
+            border-color: #764ba2;
+            background: #f0f0ff;
+        }
+        
+        .upload-icon {
+            font-size: 48px;
+            margin-bottom: 10px;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: #555;
+        }
+        
+        .form-group input {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+        
+        .form-group input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .checkbox-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .checkbox-group input[type="checkbox"] {
+            width: auto;
+        }
+        
+        .btn {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 14px 32px;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s ease;
+            width: 100%;
+        }
+        
+        .btn:hover {
+            transform: translateY(-2px);
+        }
+        
+        .btn:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .progress-section {
+            display: none;
+            margin-top: 30px;
+        }
+        
+        .progress-section.active {
+            display: block;
+        }
+        
+        .progress-bar-container {
+            background: #f0f0f0;
+            border-radius: 8px;
+            height: 30px;
+            overflow: hidden;
+            margin-bottom: 15px;
+        }
+        
+        .progress-bar {
+            height: 100%;
+            background: linear-gradient(90deg, #667eea 0%, #764ba2 100%);
+            transition: width 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: 600;
+            font-size: 14px;
+        }
+        
+        .status-message {
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 12px;
+        }
+        
+        .status-message.info {
+            background: #e3f2fd;
+            color: #1976d2;
+        }
+        
+        .status-message.success {
+            background: #e8f5e9;
+            color: #388e3c;
+        }
+        
+        .status-message.error {
+            background: #ffebee;
+            color: #d32f2f;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+        
+        .stat-card {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 8px;
+            text-align: center;
+        }
+        
+        .stat-value {
+            font-size: 28px;
+            font-weight: 700;
+            color: #667eea;
+        }
+        
+        .stat-label {
+            font-size: 14px;
+            color: #666;
+            margin-top: 5px;
+        }
+        
+        .alert {
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 15px;
+            display: none;
+        }
+        
+        .alert.show {
+            display: block;
+        }
+        
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        
+        .alert-error {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📸 Immich Snapchat Importer</h1>
+            <p>Import your Snapchat Memories to Immich with metadata preservation</p>
+        </div>
+        
+        <div class="content">
+            <!-- Upload Section -->
+            <div class="section">
+                <div class="section-title">1. Upload Snapchat Export</div>
+                <div class="upload-area" id="uploadArea">
+                    <div class="upload-icon">📁</div>
+                    <p style="margin-bottom: 8px;">
+                        <strong>Drag & drop your file here</strong>
+                    </p>
+                    <p style="color: #666; font-size: 14px;">
+                        or click to browse (JSON or HTML)
+                    </p>
+                    <input type="file" id="fileInput" accept=".json,.html" style="display: none;">
+                </div>
+                <div id="uploadAlert" class="alert"></div>
+                <div id="uploadedFile" style="margin-top: 15px; display: none;">
+                    <strong>Selected file:</strong> <span id="fileName"></span>
+                </div>
+            </div>
+            
+            <!-- Configuration Section -->
+            <div class="section">
+                <div class="section-title">2. Configure Immich Settings</div>
+                <div class="form-group">
+                    <label for="immichUrl">Immich Server URL</label>
+                    <input type="text" id="immichUrl" placeholder="http://localhost:2283/api">
+                </div>
+                <div class="form-group">
+                    <label for="apiKey">Immich API Key</label>
+                    <input type="password" id="apiKey" placeholder="Your API key from Immich settings">
+                </div>
+                <div class="form-group">
+                    <label for="delay">Download Delay (seconds)</label>
+                    <input type="number" id="delay" value="2.0" min="0.5" step="0.5">
+                </div>
+                <div class="checkbox-group">
+                    <input type="checkbox" id="skipUpload">
+                    <label for="skipUpload" style="margin-bottom: 0;">Skip Immich upload (process only)</label>
+                </div>
+            </div>
+            
+            <!-- Start Import Button -->
+            <div class="section">
+                <button class="btn" id="startBtn" disabled>Upload a file to start</button>
+            </div>
+            
+            <!-- Progress Section -->
+            <div class="progress-section" id="progressSection">
+                <div class="section-title">Import Progress</div>
+                <div class="progress-bar-container">
+                    <div class="progress-bar" id="progressBar" style="width: 0%">0%</div>
+                </div>
+                <div id="statusMessages"></div>
+                <div id="statsSection" style="display: none;">
+                    <div class="section-title">Import Statistics</div>
+                    <div class="stats-grid" id="statsGrid"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        let uploadedFilename = null;
+        let ws = null;
+        let currentJobId = null;
+        
+        // Initialize WebSocket
+        function initWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+            
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                handleWebSocketMessage(data);
+            };
+            
+            ws.onclose = () => {
+                console.log('WebSocket closed, reconnecting...');
+                setTimeout(initWebSocket, 3000);
+            };
+            
+            // Send heartbeat
+            setInterval(() => {
+                if (ws.readyState === WebSocket.OPEN) {
+                    ws.send('ping');
+                }
+            }, 30000);
+        }
+        
+        function handleWebSocketMessage(data) {
+            if (data.job_id !== currentJobId) return;
+            
+            if (data.type === 'progress') {
+                updateProgress(data.progress, data.message);
+            } else if (data.type === 'complete') {
+                updateProgress(100, data.message);
+                if (data.stats) {
+                    displayStats(data.stats);
+                }
+                document.getElementById('startBtn').disabled = false;
+            } else if (data.type === 'error') {
+                showStatus('error', data.message);
+                document.getElementById('startBtn').disabled = false;
+            }
+        }
+        
+        function updateProgress(percent, message) {
+            const progressBar = document.getElementById('progressBar');
+            progressBar.style.width = `${percent}%`;
+            progressBar.textContent = `${percent}%`;
+            
+            if (message) {
+                addStatusMessage('info', message);
+            }
+        }
+        
+        function addStatusMessage(type, message) {
+            const messagesDiv = document.getElementById('statusMessages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `status-message ${type}`;
+            messageDiv.textContent = message;
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+        
+        function displayStats(stats) {
+            const statsSection = document.getElementById('statsSection');
+            const statsGrid = document.getElementById('statsGrid');
+            
+            statsGrid.innerHTML = '';
+            
+            if (stats.summary) {
+                addStatCard('Total Files', stats.summary.total_files);
+                addStatCard('With GPS', stats.summary.with_gps);
+                addStatCard('GPS Coverage', `${stats.summary.gps_coverage_percent}%`);
+            }
+            
+            if (stats.file_sizes) {
+                addStatCard('Total Size', `${stats.file_sizes.total_mb} MB`);
+            }
+            
+            statsSection.style.display = 'block';
+        }
+        
+        function addStatCard(label, value) {
+            const statsGrid = document.getElementById('statsGrid');
+            const card = document.createElement('div');
+            card.className = 'stat-card';
+            card.innerHTML = `
+                <div class="stat-value">${value}</div>
+                <div class="stat-label">${label}</div>
+            `;
+            statsGrid.appendChild(card);
+        }
+        
+        // File upload handling
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+        
+        uploadArea.addEventListener('click', () => fileInput.click());
+        
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragging');
+        });
+        
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragging');
+        });
+        
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragging');
+            const file = e.dataTransfer.files[0];
+            handleFileSelect(file);
+        });
+        
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            handleFileSelect(file);
+        });
+        
+        async function handleFileSelect(file) {
+            if (!file) return;
+            
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            try {
+                const response = await fetch('/api/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Upload failed');
+                }
+                
+                const data = await response.json();
+                uploadedFilename = data.filename;
+                
+                document.getElementById('fileName').textContent = data.filename;
+                document.getElementById('uploadedFile').style.display = 'block';
+                document.getElementById('startBtn').textContent = 'Start Import';
+                document.getElementById('startBtn').disabled = false;
+                
+                showAlert('uploadAlert', 'success', `File uploaded successfully: ${data.filename}`);
+            } catch (error) {
+                showAlert('uploadAlert', 'error', `Upload failed: ${error.message}`);
+            }
+        }
+        
+        function showAlert(elementId, type, message) {
+            const alert = document.getElementById(elementId);
+            alert.className = `alert alert-${type} show`;
+            alert.textContent = message;
+            setTimeout(() => {
+                alert.classList.remove('show');
+            }, 5000);
+        }
+        
+        // Start import
+        document.getElementById('startBtn').addEventListener('click', async () => {
+            if (!uploadedFilename) return;
+            
+            const config = {
+                immich_url: document.getElementById('immichUrl').value,
+                api_key: document.getElementById('apiKey').value,
+                delay: parseFloat(document.getElementById('delay').value),
+                skip_upload: document.getElementById('skipUpload').checked
+            };
+            
+            try {
+                document.getElementById('startBtn').disabled = true;
+                document.getElementById('progressSection').classList.add('active');
+                document.getElementById('statusMessages').innerHTML = '';
+                document.getElementById('statsSection').style.display = 'none';
+                updateProgress(0, 'Starting import...');
+                
+                const response = await fetch('/api/import/start', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        filename: uploadedFilename,
+                        config: config
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Failed to start import');
+                }
+                
+                const data = await response.json();
+                currentJobId = data.job_id;
+                addStatusMessage('info', `Import job started: ${data.job_id}`);
+                
+            } catch (error) {
+                addStatusMessage('error', `Failed to start import: ${error.message}`);
+                document.getElementById('startBtn').disabled = false;
+            }
+        });
+        
+        // Initialize
+        initWebSocket();
+        
+        // Load config on page load
+        fetch('/api/config')
+            .then(r => r.json())
+            .then(config => {
+                if (config.immich && config.immich.url) {
+                    document.getElementById('immichUrl').value = config.immich.url;
+                }
+                if (config.download && config.download.delay) {
+                    document.getElementById('delay').value = config.download.delay;
+                }
+            })
+            .catch(() => {});
+    </script>
+</body>
+</html>
+    """
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)

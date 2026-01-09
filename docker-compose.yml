@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  # Option 1: Web Interface (Recommended)
+  # Provides a user-friendly web UI at http://localhost:8000
+  snapchat-importer-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.webapp
+    image: yourusername/immich-snapchat-importer:web
+    container_name: immich_snapchat_importer_web
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persistent storage for uploads and processed files
+      - ./snapchat-data:/app/uploads
+      - ./snapchat-work:/app/work
+    environment:
+      # Optional: Pre-configure Immich settings (can also configure via web UI)
+      - IMMICH_URL=${IMMICH_URL:-http://immich-server:2283/api}
+      - IMMICH_API_KEY=${IMMICH_API_KEY:-}
+    networks:
+      - immich
+    # Comment out if you want it to run immediately
+    profiles:
+      - web
+
+  # Option 2: CLI Mode (One-time execution)
+  # For automated/scripted imports without web interface
+  snapchat-importer-cli:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: yourusername/immich-snapchat-importer:cli
+    container_name: immich_snapchat_importer_cli
+    restart: on-failure
+    volumes:
+      - ./snapchat-data:/data
+    environment:
+      - IMMICH_URL=${IMMICH_URL:-http://immich-server:2283/api}
+      - IMMICH_API_KEY=${IMMICH_API_KEY:-}
+      - DELAY=${DELAY:-2.0}
+    command: /data/memories_history.json
+    networks:
+      - immich
+    # This service won't start by default (use profiles)
+    profiles:
+      - cli
+
+networks:
+  immich:
+    external: true
+    # If your Immich network has a different name, change it here
+    # Or remove 'external: true' to create a new network
+
+# Environment variables can be set in .env file:
+# IMMICH_URL=http://immich-server:2283/api
+# IMMICH_API_KEY=your_api_key_here
+# DELAY=2.0

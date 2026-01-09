@@ -4,4 +4,7 @@ piexif
 numpy
 requests
 pyyaml
+fastapi
+uvicorn[standard]
+python-multipart
 

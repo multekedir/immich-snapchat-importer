@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 .venv/
 env/
+venv/
 
 # --- Project Data Folders (Primary Defense) ---
 *_downloads/
@@ -10,11 +11,25 @@ env/
 snapchat-data/
 temp_extraction/
 
+# --- Web Interface Directories ---
+uploads/
+work/
+
 # --- Specific Data Files ---
 memories_history.json
 memories_history.html
 *_metadata.json
 .download_progress.json
+import_report.json
+
+# --- Configuration Files ---
+.env
+config.yaml
+
+# --- Docker Compose Files (may contain sensitive data) ---
+docker-compose.web.yml
+docker-compose.cli.yml
+# Keep docker-compose.yml as template (no sensitive data)
 
 # --- Media Extensions (Secondary Defense) ---
 # Prevents accidentally committing a stray photo in the root
@@ -32,3 +47,20 @@ memories_history.html
 !assets/
 !screenshots/
 !logo.png
+!.env.example
+!config.yaml.example
+
+# --- IDE and Editor Files ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# --- Docker ---
+.docker/
+
+# --- Logs ---
+*.log
+logs/
