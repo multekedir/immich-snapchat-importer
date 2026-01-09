@@ -1,0 +1,34 @@
+# --- Python Boilerplate ---
+__pycache__/
+*.py[cod]
+.venv/
+env/
+
+# --- Project Data Folders (Primary Defense) ---
+*_downloads/
+*_processed/
+snapchat-data/
+temp_extraction/
+
+# --- Specific Data Files ---
+memories_history.json
+memories_history.html
+*_metadata.json
+.download_progress.json
+
+# --- Media Extensions (Secondary Defense) ---
+# Prevents accidentally committing a stray photo in the root
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.jpg
+*.jpeg
+*.png
+*.bin
+
+# --- Exceptions (Allow these) ---
+# Un-ignore these folders so you can add screenshots to your README
+!assets/
+!screenshots/
+!logo.png
