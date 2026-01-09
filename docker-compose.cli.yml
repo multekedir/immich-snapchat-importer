@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  # CLI Mode (One-time execution)
+  # For automated/scripted imports without web interface
+  snapchat-importer-cli:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: yourusername/immich-snapchat-importer:cli
+    container_name: immich_snapchat_importer_cli
+    restart: on-failure
+    volumes:
+      - ./snapchat-data:/data
+    environment:
+      - IMMICH_URL=${IMMICH_URL:-http://immich-server:2283/api}
+      - IMMICH_API_KEY=${IMMICH_API_KEY:-}
+      - DELAY=${DELAY:-2.0}
+    command: /data/memories_history.json
+    networks:
+      - immich
+
+networks:
+  immich:
+    external: true
+    # If your Immich network has a different name, change it here
+    # Or remove 'external: true' to create a new network
+
+# Environment variables can be set in .env file:
+# IMMICH_URL=http://immich-server:2283/api
+# IMMICH_API_KEY=your_api_key_here
+# DELAY=2.0

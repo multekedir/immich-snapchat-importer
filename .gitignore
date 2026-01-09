@@ -26,11 +26,6 @@ import_report.json
 .env
 config.yaml
 
-# --- Docker Compose Files (may contain sensitive data) ---
-docker-compose.web.yml
-docker-compose.cli.yml
-# Keep docker-compose.yml as template (no sensitive data)
-
 # --- Media Extensions (Secondary Defense) ---
 # Prevents accidentally committing a stray photo in the root
 *.mp4

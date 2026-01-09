@@ -1,0 +1,33 @@
+services:
+  # Web Interface (Recommended)
+  # Provides a user-friendly web UI at http://localhost:8000
+  snapchat-importer-web:
+    build:
+      context: .
+      dockerfile: Dockerfile.webapp
+    image: multekedir/immich-snapchat-importer:web
+    container_name: immich_snapchat_importer_web
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persistent storage for uploads and processed files
+      - ./snapchat-data:/app/uploads
+      - ./snapchat-work:/app/work
+    environment:
+      # Optional: Pre-configure Immich settings (can also configure via web UI)
+      - IMMICH_URL=${IMMICH_URL:-http://10.0.0.180:2283/api}
+      - IMMICH_API_KEY=${IMMICH_API_KEY:-}
+    networks:
+      - immich
+
+networks:
+  immich:
+    driver: bridge
+    # If you want to connect to an existing Immich network, change to:
+    # external: true
+    # name: immich  # or whatever your Immich network is named
+
+# Environment variables can be set in .env file:
+# IMMICH_URL=http://immich-server:2283/api
+# IMMICH_API_KEY=your_api_key_here
