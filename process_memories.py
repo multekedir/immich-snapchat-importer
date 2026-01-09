@@ -23,6 +23,12 @@ from datetime import datetime
 from PIL import Image
 import piexif
 import requests
+from collections import Counter
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 # Configure logging
 logging.basicConfig(
@@ -453,15 +459,35 @@ class MemoryDownloader:
     def load_progress(self):
         """Load previously downloaded files"""
         if self.progress_file.exists():
-            with open(self.progress_file) as f:
-                return set(json.load(f))
+            try:
+                with open(self.progress_file) as f:
+                    return set(json.load(f))
+            except (json.JSONDecodeError, IOError) as e:
+                logger.warning(f"⚠️  Progress file corrupted or unreadable: {e}")
+                logger.info("   Starting fresh download list...")
+                # Backup corrupted file
+                backup_file = self.progress_file.with_suffix('.corrupted')
+                try:
+                    self.progress_file.rename(backup_file)
+                    logger.info(f"   Corrupted file backed up to: {backup_file}")
+                except:
+                    pass
         return set()
     
     def save_progress(self, url):
-        """Mark file as downloaded"""
+        """Mark file as downloaded - uses atomic write to prevent corruption"""
         self.downloaded.add(url)
-        with open(self.progress_file, 'w') as f:
-            json.dump(list(self.downloaded), f)
+        temp_file = self.progress_file.with_suffix('.tmp')
+        try:
+            with open(temp_file, 'w') as f:
+                json.dump(list(self.downloaded), f)
+            # Atomic replace: write to temp file first, then replace original
+            temp_file.replace(self.progress_file)
+        except Exception as e:
+            logger.warning(f"      ⚠️  Could not save progress: {e}")
+            # Clean up temp file if it exists
+            if temp_file.exists():
+                temp_file.unlink()
     
     def download_file(self, url, output_path, is_get_request=True, max_retries=3):
         """Download with retry logic"""
@@ -790,7 +816,7 @@ class MemoryProcessor:
                     base_img.convert('RGB').save(output_path, 'JPEG', quality=95)
                 else:
                     output_path = self.output_folder / f"{bin_path.stem}.mp4"
-                    self._apply_overlay_to_video(media_file, overlay_file, output_path)
+                    self._apply_overlay_to_video(media_file, overlay_file, output_path, metadata)
             else:
                 # No overlay, just copy
                 if media_type == 'image':
@@ -817,8 +843,15 @@ class MemoryProcessor:
             if extract_folder and extract_folder.exists():
                 shutil.rmtree(extract_folder)
     
-    def _apply_overlay_to_video(self, media_file, overlay_file, output_path):
-        """Apply overlay to video while preserving audio"""
+    def _apply_overlay_to_video(self, media_file, overlay_file, output_path, metadata=None):
+        """Apply overlay to video while preserving audio
+        
+        Args:
+            media_file: Path to source video file
+            overlay_file: Path to overlay image file
+            output_path: Path to save processed video
+            metadata: Optional metadata dict for embedding creation time
+        """
         temp_output = self.temp_folder / f"{output_path.stem}_temp.mp4"
         
         cap = cv2.VideoCapture(str(media_file))
@@ -832,6 +865,7 @@ class MemoryProcessor:
         overlay_img = cv2.imread(str(overlay_file), cv2.IMREAD_UNCHANGED)
         if overlay_img is None:
             cap.release()
+            cv2.destroyAllWindows()
             return
         
         overlay_img = cv2.resize(overlay_img, (width, height), interpolation=cv2.INTER_AREA)
@@ -889,6 +923,7 @@ class MemoryProcessor:
         
         cap.release()
         out.release()
+        cv2.destroyAllWindows()  # Cleanup to prevent memory leaks
         
         # Re-encode: Merge processed video with original audio from source
         # FIXED: Added logic to map audio from original file
@@ -916,21 +951,41 @@ class MemoryProcessor:
             cmd_fallback = [
                 'ffmpeg', '-i', str(temp_output),
                 '-c:v', 'libx264', '-preset', 'medium', '-crf', '23',
-                '-y', str(output_path)
             ]
+            
+            # Add metadata if available
+            if metadata and 'date_utc' in metadata:
+                try:
+                    date_str = metadata['date_utc']
+                    cmd_fallback.extend(['-metadata', f'creation_time={date_str}'])
+                except Exception as e:
+                    logger.warning(f"      ⚠️  Could not add metadata to fallback: {e}")
+            
+            cmd_fallback.extend(['-y', str(output_path)])
             subprocess.run(cmd_fallback, capture_output=True)
 
         if temp_output.exists():
             temp_output.unlink()
     
-    def process_all(self):
-        """Process all downloaded files"""
+    def process_all(self, dry_run=False):
+        """Process all downloaded files
+        
+        Args:
+            dry_run (bool): If True, preview what will be processed without modifying files
+        """
         logger.info("\n" + "=" * 80)
-        logger.info("PHASE 3: PROCESSING FILES AND APPLYING METADATA")
-        logger.info("=" * 80)
+        if dry_run:
+            logger.info("PHASE 3: PREVIEW MODE (DRY RUN)")
+            logger.info("=" * 80)
+            logger.info("🔍 DRY RUN - No files will be modified")
+            logger.info("   This preview shows what would be processed")
+        else:
+            logger.info("PHASE 3: PROCESSING FILES AND APPLYING METADATA")
+            logger.info("=" * 80)
         
         success_count = 0
         failed_count = 0
+        skipped_count = 0
         
         # Process each downloaded file
         for file_path in sorted(self.download_folder.glob("*")):
@@ -954,6 +1009,7 @@ class MemoryProcessor:
                 
                 if not metadata:
                     logger.warning(f"\n⚠️  {file_path.name}: No metadata found, skipping")
+                    skipped_count += 1
                     continue
                 
                 index = metadata['index']
@@ -971,35 +1027,55 @@ class MemoryProcessor:
                     logger.info(f"  📅 Date: {metadata['date_utc']}")
                 
                 # Process based on file type
-                if file_path.suffix.lower() == '.bin':
-                    if self.process_bin_file(file_path, metadata):
-                        success_count += 1
-                    else:
-                        failed_count += 1
-                else:
-                    # Copy to output
+                if dry_run:
+                    # Preview mode - just show what would happen
                     output_path = self.output_folder / file_path.name
-                    shutil.copy2(file_path, output_path)
-                    logger.info("    ✓ Copied to output")
-                    
-                    # Apply metadata
-                    logger.info("    📝 Applying metadata from JSON...")
-                    if file_path.suffix.lower() in ['.jpg', '.jpeg']:
-                        self.apply_metadata_to_image(output_path, metadata)
-                    elif file_path.suffix.lower() == '.mp4':
-                        self.apply_metadata_to_video(output_path, metadata)
-                    
+                    if file_path.suffix.lower() == '.bin':
+                        logger.info(f"  🔍 Would extract .bin file")
+                        logger.info(f"  🔍 Would save to: {output_path}")
+                    else:
+                        logger.info(f"  🔍 Would copy to: {output_path}")
+                        logger.info(f"  🔍 Would apply metadata (date, GPS)")
                     success_count += 1
+                else:
+                    # Actual processing
+                    if file_path.suffix.lower() == '.bin':
+                        if self.process_bin_file(file_path, metadata):
+                            success_count += 1
+                        else:
+                            failed_count += 1
+                    else:
+                        # Copy to output
+                        output_path = self.output_folder / file_path.name
+                        shutil.copy2(file_path, output_path)
+                        logger.info("    ✓ Copied to output")
+                        
+                        # Apply metadata
+                        logger.info("    📝 Applying metadata from JSON...")
+                        if file_path.suffix.lower() in ['.jpg', '.jpeg']:
+                            self.apply_metadata_to_image(output_path, metadata)
+                        elif file_path.suffix.lower() == '.mp4':
+                            self.apply_metadata_to_video(output_path, metadata)
+                        
+                        success_count += 1
         
-        # Cleanup
-        if self.temp_folder.exists():
+        # Cleanup (skip in dry run)
+        if not dry_run and self.temp_folder.exists():
             shutil.rmtree(self.temp_folder)
         
         logger.info("\n" + "=" * 80)
-        logger.info("PROCESSING SUMMARY")
+        if dry_run:
+            logger.info("PREVIEW SUMMARY (DRY RUN)")
+        else:
+            logger.info("PROCESSING SUMMARY")
         logger.info("=" * 80)
-        logger.info(f"✓ Processed: {success_count}")
-        logger.error(f"✗ Failed: {failed_count}")
+        if dry_run:
+            logger.info(f"🔍 Would process: {success_count}")
+            if skipped_count > 0:
+                logger.warning(f"⚠️  Would skip (no metadata): {skipped_count}")
+        else:
+            logger.info(f"✓ Processed: {success_count}")
+            logger.error(f"✗ Failed: {failed_count}")
         logger.info(f"\n✓ Output folder: {self.output_folder.absolute()}")
 
 
@@ -1177,6 +1253,255 @@ def upload_to_immich(processed_folder, metadata_file, immich_url, api_key):
     return success_count, failed_count, skipped_count
 
 
+def generate_report(metadata_file, output_folder):
+    """
+    Generate a detailed import report with statistics about processed files.
+    
+    Args:
+        metadata_file (str|Path): Path to metadata JSON file
+        output_folder (str|Path): Path to folder containing processed files
+    
+    Returns:
+        dict: Report dictionary with statistics
+    """
+    logger.info("\n" + "=" * 80)
+    logger.info("GENERATING IMPORT REPORT")
+    logger.info("=" * 80)
+    
+    output_path = Path(output_folder)
+    metadata_path = Path(metadata_file)
+    
+    # Load metadata
+    try:
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+    except Exception as e:
+        logger.error(f"❌ Could not load metadata: {e}")
+        return None
+    
+    # Get all processed files
+    files = []
+    total_size = 0
+    
+    for file_path in sorted(output_path.glob("*")):
+        if file_path.is_file() and file_path.suffix.lower() in ['.mp4', '.jpg', '.jpeg', '.png', '.mov', '.avi', '.mkv']:
+            file_info = {
+                'name': file_path.name,
+                'path': str(file_path),
+                'size': file_path.stat().st_size,
+                'extension': file_path.suffix.lower(),
+                'year': None,
+                'has_gps': False,
+                'date_utc': None
+            }
+            
+            # Try to find metadata for this file
+            filename_base = file_path.stem
+            file_metadata = None
+            
+            # Look up in metadata
+            for memory in metadata.get('memories', []):
+                if memory.get('filename', '').startswith(filename_base) or filename_base.startswith(memory.get('filename', '').split('.')[0]):
+                    file_metadata = memory
+                    break
+                
+                # Try date matching
+                if 'date_key' in memory:
+                    if memory['date_key'] in filename_base or filename_base in memory['date_key']:
+                        file_metadata = memory
+                        break
+            
+            if file_metadata:
+                # Extract year from date
+                if 'date_utc' in file_metadata:
+                    try:
+                        date_str = file_metadata['date_utc']
+                        dt = datetime.fromisoformat(date_str.replace('Z', '+00:00'))
+                        file_info['year'] = dt.year
+                        file_info['date_utc'] = file_metadata['date_utc']
+                    except:
+                        pass
+                
+                # Check GPS
+                if 'location' in file_metadata:
+                    location = file_metadata['location']
+                    file_info['has_gps'] = location.get('valid', False)
+            
+            files.append(file_info)
+            total_size += file_info['size']
+    
+    # Calculate statistics
+    total_files = len(files)
+    if total_files == 0:
+        logger.warning("⚠️  No processed files found in output folder")
+        return None
+    
+    # By year
+    years = [f['year'] for f in files if f['year']]
+    by_year = dict(Counter(years))
+    
+    # GPS coverage
+    with_gps = sum(1 for f in files if f['has_gps'])
+    without_gps = total_files - with_gps
+    
+    # By media type
+    by_type = dict(Counter(f['extension'] for f in files))
+    
+    # File sizes
+    avg_size = total_size / total_files if total_files > 0 else 0
+    total_mb = total_size / (1024 * 1024)
+    avg_mb = avg_size / (1024 * 1024)
+    
+    # Date range
+    dates = [f['date_utc'] for f in files if f['date_utc']]
+    date_range = {}
+    if dates:
+        try:
+            parsed_dates = [datetime.fromisoformat(d.replace('Z', '+00:00')) for d in dates]
+            date_range = {
+                'earliest': min(parsed_dates).isoformat(),
+                'latest': max(parsed_dates).isoformat()
+            }
+        except:
+            pass
+    
+    # Build report
+    report = {
+        'import_date': datetime.now().isoformat(),
+        'metadata_source': str(metadata_path),
+        'output_folder': str(output_path),
+        'summary': {
+            'total_files': total_files,
+            'with_gps': with_gps,
+            'without_gps': without_gps,
+            'gps_coverage_percent': round((with_gps / total_files * 100) if total_files > 0 else 0, 2)
+        },
+        'by_year': by_year,
+        'by_type': by_type,
+        'file_sizes': {
+            'total_mb': round(total_mb, 2),
+            'avg_mb': round(avg_mb, 2),
+            'total_bytes': total_size
+        },
+        'date_range': date_range
+    }
+    
+    # Save report
+    report_path = output_path / 'import_report.json'
+    try:
+        with open(report_path, 'w') as f:
+            json.dump(report, f, indent=2)
+        logger.info(f"✓ Report saved to: {report_path}")
+    except Exception as e:
+        logger.error(f"❌ Could not save report: {e}")
+        return report
+    
+    # Print summary
+    logger.info("\n" + "=" * 80)
+    logger.info("IMPORT STATISTICS")
+    logger.info("=" * 80)
+    logger.info(f"📊 Total files: {total_files}")
+    logger.info(f"   └─ Videos: {by_type.get('.mp4', 0) + by_type.get('.mov', 0) + by_type.get('.avi', 0) + by_type.get('.mkv', 0)}")
+    logger.info(f"   └─ Images: {by_type.get('.jpg', 0) + by_type.get('.jpeg', 0) + by_type.get('.png', 0)}")
+    logger.info("")
+    logger.info(f"📍 GPS Coverage:")
+    logger.info(f"   └─ With GPS: {with_gps} ({report['summary']['gps_coverage_percent']}%)")
+    logger.info(f"   └─ Without GPS: {without_gps}")
+    logger.info("")
+    logger.info(f"💾 File Sizes:")
+    logger.info(f"   └─ Total: {total_mb:.2f} MB")
+    logger.info(f"   └─ Average: {avg_mb:.2f} MB")
+    logger.info("")
+    if by_year:
+        logger.info(f"📅 Files by Year:")
+        for year in sorted(by_year.keys()):
+            logger.info(f"   └─ {year}: {by_year[year]} files")
+    if date_range:
+        logger.info("")
+        logger.info(f"📆 Date Range:")
+        logger.info(f"   └─ Earliest: {date_range['earliest']}")
+        logger.info(f"   └─ Latest: {date_range['latest']}")
+    logger.info("")
+    
+    return report
+
+
+def load_config(config_path='config.yaml'):
+    """
+    Load configuration from YAML file with environment variable substitution.
+    
+    Priority order: CLI args > Environment variables > Config file
+    
+    Args:
+        config_path (str): Path to config.yaml file
+    
+    Returns:
+        dict: Configuration dictionary with defaults
+    """
+    config = {
+        'immich': {
+            'url': None,
+            'api_key': None
+        },
+        'download': {
+            'delay': 2.0,
+            'max_retries': 3,
+            'batch_size': 50
+        },
+        'processing': {
+            'overlay_opacity': 1.3,
+            'shadow_offset': 2
+        }
+    }
+    
+    if yaml is None:
+        logger.warning("⚠️  PyYAML not installed. Install with: pip install pyyaml")
+        logger.info("   Continuing without config file support...")
+        return config
+    
+    config_file = Path(config_path)
+    if not config_file.exists():
+        return config
+    
+    try:
+        with open(config_file, 'r') as f:
+            file_config = yaml.safe_load(f) or {}
+        
+        # Merge config file values
+        if 'immich' in file_config:
+            if 'url' in file_config['immich']:
+                url = file_config['immich']['url']
+                # Support environment variable substitution
+                if url.startswith('${') and url.endswith('}'):
+                    env_var = url[2:-1]
+                    config['immich']['url'] = os.environ.get(env_var) or config['immich']['url']
+                else:
+                    config['immich']['url'] = url
+            
+            if 'api_key' in file_config['immich']:
+                api_key = file_config['immich']['api_key']
+                # Support environment variable substitution
+                if isinstance(api_key, str) and api_key.startswith('${') and api_key.endswith('}'):
+                    env_var = api_key[2:-1]
+                    config['immich']['api_key'] = os.environ.get(env_var) or config['immich']['api_key']
+                else:
+                    config['immich']['api_key'] = api_key
+        
+        if 'download' in file_config:
+            config['download'].update(file_config['download'])
+        
+        if 'processing' in file_config:
+            config['processing'].update(file_config['processing'])
+        
+        logger.info(f"✓ Loaded configuration from {config_path}")
+        
+    except Exception as e:
+        logger.warning(f"⚠️  Could not load config file {config_path}: {e}")
+        logger.info("   Using default configuration...")
+    
+    return config
+
+
 def main():
     if len(sys.argv) < 2:
         logger.info("Usage:")
@@ -1188,9 +1513,13 @@ def main():
         logger.info("\nOptions:")
         logger.info("  --dry-run           Extract metadata only (no download/processing)")
         logger.info("  --process-only      Process already downloaded files (skip download)")
-        logger.info("  --delay SECONDS     Delay between downloads (default: 2)")
-        logger.info("  --immich-url URL    Immich server URL (e.g., http://localhost:2283/api)")
-        logger.info("  --api-key KEY       Immich API key (from Account Settings)")
+        logger.info("  --delay SECONDS     Delay between downloads (default: 2, or from config.yaml)")
+        logger.info("  --immich-url URL    Immich server URL (overrides config.yaml and env vars)")
+        logger.info("  --api-key KEY       Immich API key (overrides config.yaml and env vars)")
+        logger.info("\nConfiguration Priority:")
+        logger.info("  1. Command-line arguments (highest)")
+        logger.info("  2. Environment variables (IMMICH_URL, IMMICH_API_KEY, DELAY)")
+        logger.info("  3. config.yaml file (lowest)")
         logger.info("\nExamples:")
         logger.info("  # Dry run - extract metadata only from HTML:")
         logger.info("  python3 process_memories.py memories_history.html --dry-run")
@@ -1217,10 +1546,19 @@ def main():
         
         input_file = sys.argv[2]
         
-        # Parse Immich arguments for process-only mode
-        immich_url = os.environ.get('IMMICH_URL')
-        api_key = os.environ.get('IMMICH_API_KEY')
+        # Load config file (lowest priority)
+        config = load_config()
         
+        # Parse Immich arguments for process-only mode
+        # Priority: CLI args > Environment variables > Config file
+        immich_url = config['immich']['url']
+        api_key = config['immich']['api_key']
+        
+        # Override with environment variables
+        immich_url = os.environ.get('IMMICH_URL') or immich_url
+        api_key = os.environ.get('IMMICH_API_KEY') or api_key
+        
+        # Override with CLI arguments
         i = 3
         while i < len(sys.argv):
             arg = sys.argv[i]
@@ -1319,6 +1657,9 @@ def main():
         processor = MemoryProcessor(metadata_json, download_folder, output_folder)
         processor.process_all()
         
+        # Generate import report
+        generate_report(metadata_json, output_folder)
+        
         # PHASE 4: Upload to Immich (if configured)
         if immich_url and api_key:
             upload_to_immich(output_folder, metadata_json, immich_url, api_key)
@@ -1339,15 +1680,20 @@ def main():
     # Normal flow - input file required (HTML or JSON)
     input_file = sys.argv[1]
     
-    # Parse arguments
-    dry_run = False
-    delay = 2.0
-    immich_url = None
-    api_key = None
+    # Load config file (lowest priority)
+    config = load_config()
     
-    # Check for environment variables first
+    # Parse arguments
+    # Priority: CLI args > Environment variables > Config file
+    dry_run = False
+    delay = config['download']['delay']
+    immich_url = config['immich']['url']
+    api_key = config['immich']['api_key']
+    
+    # Override with environment variables
     immich_url = os.environ.get('IMMICH_URL') or immich_url
     api_key = os.environ.get('IMMICH_API_KEY') or api_key
+    delay = float(os.environ.get('DELAY', delay))
     
     i = 2
     while i < len(sys.argv):
@@ -1462,6 +1808,9 @@ def main():
     # PHASE 3: Process and apply metadata
     processor = MemoryProcessor(metadata_json, download_folder, output_folder)
     processor.process_all()
+    
+    # Generate import report
+    generate_report(metadata_json, output_folder)
     
     # PHASE 4: Upload to Immich (if configured)
     if immich_url and api_key:

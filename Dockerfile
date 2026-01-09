@@ -1,7 +1,12 @@
-# Use a slim python image to keep size down
+# Multi-stage build for smaller image
+FROM python:3.10-slim as builder
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --user --no-cache-dir -r requirements.txt
+
 FROM python:3.10-slim
 
-# 1. Install System Dependencies
+# Install System Dependencies
 # ffmpeg: for video processing
 # libgl1/libglib: required by opencv-python
 RUN apt-get update && apt-get install -y \
@@ -10,17 +15,19 @@ RUN apt-get update && apt-get install -y \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# 2. Setup Working Directory
+# Copy Python dependencies from builder stage
+COPY --from=builder /root/.local /root/.local
+ENV PATH=/root/.local/bin:$PATH
+
+# Setup Working Directory
 WORKDIR /app
 
-# 3. Install Python Dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# 4. Copy Your Code
+# Copy application code
 COPY process_memories.py .
 COPY README.md .
 
-# 5. Define the Entrypoint
-# We use a shell script entrypoint to handle arguments or defaults
+# Health check to verify Python environment
+HEALTHCHECK CMD python -c "import sys; sys.exit(0)"
+
+# Define the Entrypoint
 ENTRYPOINT ["python", "process_memories.py"]

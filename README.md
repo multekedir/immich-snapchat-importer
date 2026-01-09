@@ -157,11 +157,38 @@ python process_memories.py --process-only memories_history.json \
 
 ## ⚙️ Configuration Options
 
-| Environment Variable | CLI Argument | Description | Default |
-|---------------------|--------------|-------------|---------|
-| `IMMICH_URL` | `--immich-url` | Your Immich Server API URL (e.g., `http://localhost:2283/api`) | None |
-| `IMMICH_API_KEY` | `--api-key` | Your API Key (Create in Immich: Account Settings → API Keys) | None |
-| `DELAY` | `--delay` | Seconds to wait between downloads (avoids rate limiting) | 2.0 |
+Configuration can be set via three methods (in priority order):
+
+1. **Command-line arguments** (highest priority)
+2. **Environment variables**
+3. **`config.yaml` file** (lowest priority)
+
+### Configuration File
+
+Create a `config.yaml` file in the project root:
+
+```yaml
+immich:
+  url: http://immich-server:2283/api
+  api_key: ${IMMICH_API_KEY}  # Supports environment variable substitution
+download:
+  delay: 2.0
+  max_retries: 3
+  batch_size: 50
+processing:
+  overlay_opacity: 1.3
+  shadow_offset: 2
+```
+
+**Note**: Use `${VARIABLE_NAME}` syntax to reference environment variables in the config file.
+
+### Configuration Options Table
+
+| Environment Variable | CLI Argument | Config File | Description | Default |
+|---------------------|--------------|-------------|-------------|---------|
+| `IMMICH_URL` | `--immich-url` | `immich.url` | Your Immich Server API URL | None |
+| `IMMICH_API_KEY` | `--api-key` | `immich.api_key` | Your API Key (Create in Immich: Account Settings → API Keys) | None |
+| `DELAY` | `--delay` | `download.delay` | Seconds to wait between downloads (avoids rate limiting) | 2.0 |
 
 **Note**: If Immich URL and API key are not provided, the tool will skip the upload phase and only process files locally.
 

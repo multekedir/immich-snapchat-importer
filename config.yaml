@@ -1,0 +1,10 @@
+immich:
+  url: http://immich-server:2283/api
+  api_key: ${IMMICH_API_KEY}  # Still support env vars
+download:
+  delay: 2.0
+  max_retries: 3
+  batch_size: 50
+processing:
+  overlay_opacity: 1.3
+  shadow_offset: 2

@@ -3,4 +3,5 @@ Pillow
 piexif
 numpy
 requests
+pyyaml
 
