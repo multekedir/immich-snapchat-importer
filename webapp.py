@@ -29,6 +29,9 @@ from process_memories import (
     load_config
 )
 
+# Import repair functionality
+from repair_immich_metadata import ImmichMetadataRepairer
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -86,6 +89,17 @@ class ImportStatus(BaseModel):
     message: str
     stats: Optional[dict] = None
 
+class RepairRequest(BaseModel):
+    metadata_file: str
+    immich_url: str
+    api_key: str
+    dry_run: bool = False
+
+class ProcessOnlyRequest(BaseModel):
+    metadata_file: str
+    immich_url: Optional[str] = None
+    api_key: Optional[str] = None
+
 # Ensure directories exist
 UPLOAD_DIR = Path("./uploads")
 WORK_DIR = Path("./work")
@@ -127,19 +141,16 @@ async def upload_file(file: UploadFile = File(...)):
         logger.error(f"Upload failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-class ImportRequest(BaseModel):
-    filename: str
-    config: ImportConfig
-
 @app.post("/api/import/start")
 async def start_import(
-    request: ImportRequest,
+    filename: str,
+    config: ImportConfig,
     background_tasks: BackgroundTasks
 ):
     """Start a new import job"""
     try:
         # Validate file exists
-        input_file = UPLOAD_DIR / request.filename
+        input_file = UPLOAD_DIR / filename
         if not input_file.exists():
             raise HTTPException(status_code=404, detail="File not found")
         
@@ -149,13 +160,13 @@ async def start_import(
         # Create job info
         job_info = {
             "job_id": job_id,
-            "filename": request.filename,
+            "filename": filename,
             "status": "queued",
             "progress": 0,
             "current_phase": "Initializing",
             "message": "Import job created",
             "started_at": datetime.now().isoformat(),
-            "config": request.config.dict()
+            "config": config.dict()
         }
         
         state.add_import(job_id, job_info)
@@ -165,7 +176,7 @@ async def start_import(
             run_import_job,
             job_id,
             str(input_file),
-            request.config
+            config
         )
         
         return {"job_id": job_id, "status": "queued"}
@@ -347,6 +358,189 @@ async def run_import_job(job_id: str, input_file: str, config: ImportConfig):
             "message": f"Import failed: {str(e)}"
         })
 
+async def run_repair_job(job_id, metadata_file, immich_url, api_key, dry_run):
+    """Background task for metadata repair"""
+    try:
+        state.update_import(job_id, {
+            "status": "running",
+            "progress": 10,
+            "message": "Fetching assets from Immich..."
+        })
+        
+        await state.broadcast({
+            "type": "progress",
+            "job_id": job_id,
+            "progress": 10,
+            "message": "Fetching assets from Immich..."
+        })
+        
+        # Run repair
+        repairer = ImmichMetadataRepairer(
+            metadata_file,
+            immich_url,
+            api_key
+        )
+        
+        state.update_import(job_id, {
+            "progress": 30,
+            "message": "Checking asset metadata..."
+        })
+        
+        await state.broadcast({
+            "type": "progress",
+            "job_id": job_id,
+            "progress": 30,
+            "message": "Checking asset metadata..."
+        })
+        
+        checked, needs_repair, repaired = repairer.repair_all(dry_run=dry_run)
+        
+        state.update_import(job_id, {
+            "status": "complete",
+            "progress": 100,
+            "message": f"Repair complete! {'Would repair' if dry_run else 'Repaired'} {needs_repair} assets",
+            "completed_at": datetime.now().isoformat(),
+            "stats": {
+                "checked": checked,
+                "needs_repair": needs_repair,
+                "repaired": repaired if not dry_run else 0,
+                "dry_run": dry_run
+            }
+        })
+        
+        await state.broadcast({
+            "type": "complete",
+            "job_id": job_id,
+            "progress": 100,
+            "message": f"Repair complete! {'Would repair' if dry_run else 'Repaired'} {needs_repair} assets",
+            "stats": {
+                "checked": checked,
+                "needs_repair": needs_repair,
+                "repaired": repaired if not dry_run else 0
+            }
+        })
+    
+    except Exception as e:
+        logger.error(f"Repair job {job_id} failed: {e}")
+        state.update_import(job_id, {
+            "status": "failed",
+            "message": str(e),
+            "failed_at": datetime.now().isoformat()
+        })
+        await state.broadcast({
+            "type": "error",
+            "job_id": job_id,
+            "message": f"Repair failed: {str(e)}"
+        })
+
+async def run_process_only_job(job_id, metadata_file, immich_url, api_key):
+    """Background task for process-only (already downloaded files)"""
+    try:
+        # Load metadata to find download folder
+        with open(metadata_file) as f:
+            metadata = json.load(f)
+        
+        base_name = Path(metadata_file).stem.replace('_metadata', '')
+        download_folder = WORK_DIR / f"{base_name}_downloads"
+        output_folder = WORK_DIR / f"{base_name}_processed"
+        
+        if not download_folder.exists():
+            raise Exception(f"Download folder not found: {download_folder}")
+        
+        state.update_import(job_id, {
+            "status": "processing",
+            "progress": 20,
+            "message": "Processing files..."
+        })
+        
+        await state.broadcast({
+            "type": "progress",
+            "job_id": job_id,
+            "progress": 20,
+            "message": "Processing files and applying metadata..."
+        })
+        
+        processor = MemoryProcessor(metadata_file, str(download_folder), str(output_folder))
+        processor.process_all()
+        
+        state.update_import(job_id, {
+            "progress": 60,
+            "message": "Files processed successfully"
+        })
+        
+        await state.broadcast({
+            "type": "progress",
+            "job_id": job_id,
+            "progress": 60,
+            "message": "Files processed successfully"
+        })
+        
+        # Generate report
+        report = generate_report(metadata_file, str(output_folder))
+        
+        # Upload to Immich if configured
+        if immich_url and api_key:
+            state.update_import(job_id, {
+                "status": "uploading",
+                "progress": 70,
+                "message": "Uploading to Immich..."
+            })
+            
+            await state.broadcast({
+                "type": "progress",
+                "job_id": job_id,
+                "progress": 70,
+                "message": "Uploading to Immich..."
+            })
+            
+            upload_success, upload_failed, upload_skipped = upload_to_immich(
+                str(output_folder),
+                metadata_file,
+                immich_url,
+                api_key
+            )
+            
+            state.update_import(job_id, {
+                "progress": 95,
+                "message": f"Uploaded {upload_success} files"
+            })
+            
+            await state.broadcast({
+                "type": "progress",
+                "job_id": job_id,
+                "progress": 95,
+                "message": f"Uploaded {upload_success} files"
+            })
+        
+        state.update_import(job_id, {
+            "status": "complete",
+            "progress": 100,
+            "message": "Processing complete!",
+            "completed_at": datetime.now().isoformat(),
+            "stats": report if report else {}
+        })
+        
+        await state.broadcast({
+            "type": "complete",
+            "job_id": job_id,
+            "progress": 100,
+            "message": "Processing complete!",
+            "stats": report if report else {}
+        })
+    
+    except Exception as e:
+        logger.error(f"Process job {job_id} failed: {e}")
+        state.update_import(job_id, {
+            "status": "failed",
+            "message": str(e),
+            "failed_at": datetime.now().isoformat()
+        })
+        await state.broadcast({
+            "type": "error",
+            "job_id": job_id,
+            "message": f"Processing failed: {str(e)}"
+        })
+
 @app.get("/api/import/status/{job_id}")
 async def get_import_status(job_id: str):
     """Get status of an import job"""
@@ -360,6 +554,109 @@ async def get_import_status(job_id: str):
 async def list_imports():
     """List all import jobs"""
     return {"imports": list(state.active_imports.values())}
+
+@app.post("/api/repair/start")
+async def start_repair(
+    request: RepairRequest,
+    background_tasks: BackgroundTasks
+):
+    """Start Immich metadata repair job"""
+    try:
+        # Validate metadata file exists
+        metadata_path = WORK_DIR / request.metadata_file
+        if not metadata_path.exists():
+            raise HTTPException(status_code=404, detail="Metadata file not found")
+        
+        job_id = f"repair_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        job_info = {
+            "job_id": job_id,
+            "type": "repair",
+            "status": "queued",
+            "progress": 0,
+            "message": "Starting metadata repair...",
+            "started_at": datetime.now().isoformat(),
+            "config": {
+                "metadata_file": request.metadata_file,
+                "immich_url": request.immich_url,
+                "dry_run": request.dry_run
+            }
+        }
+        
+        state.add_import(job_id, job_info)
+        
+        background_tasks.add_task(
+            run_repair_job,
+            job_id,
+            str(metadata_path),
+            request.immich_url,
+            request.api_key,
+            request.dry_run
+        )
+        
+        return {"job_id": job_id, "status": "queued"}
+    
+    except Exception as e:
+        logger.error(f"Failed to start repair: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/process/start")
+async def start_process_only(
+    request: ProcessOnlyRequest,
+    background_tasks: BackgroundTasks
+):
+    """Start process-only job (for already downloaded files)"""
+    try:
+        metadata_path = WORK_DIR / request.metadata_file
+        if not metadata_path.exists():
+            raise HTTPException(status_code=404, detail="Metadata file not found")
+        
+        job_id = f"process_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        
+        job_info = {
+            "job_id": job_id,
+            "type": "process",
+            "status": "queued",
+            "progress": 0,
+            "message": "Starting processing...",
+            "started_at": datetime.now().isoformat(),
+            "config": {
+                "metadata_file": request.metadata_file,
+                "immich_url": request.immich_url
+            }
+        }
+        
+        state.add_import(job_id, job_info)
+        
+        background_tasks.add_task(
+            run_process_only_job,
+            job_id,
+            str(metadata_path),
+            request.immich_url,
+            request.api_key
+        )
+        
+        return {"job_id": job_id, "status": "queued"}
+    
+    except Exception as e:
+        logger.error(f"Failed to start processing: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/metadata/list")
+async def list_metadata_files():
+    """List available metadata files"""
+    try:
+        metadata_files = []
+        for file in WORK_DIR.glob("*_metadata.json"):
+            metadata_files.append({
+                "filename": file.name,
+                "size": file.stat().st_size,
+                "modified": datetime.fromtimestamp(file.stat().st_mtime).isoformat()
+            })
+        return {"files": metadata_files}
+    except Exception as e:
+        logger.error(f"Failed to list metadata files: {e}")
+        return {"files": []}
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -443,6 +740,44 @@ def get_main_html():
         .header p {
             opacity: 0.9;
             font-size: 14px;
+        }
+        
+        .tabs {
+            display: flex;
+            background: #f8f9fa;
+            border-bottom: 2px solid #e0e0e0;
+        }
+        
+        .tab-button {
+            flex: 1;
+            padding: 15px 20px;
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 500;
+            color: #666;
+            transition: all 0.3s ease;
+            border-bottom: 3px solid transparent;
+        }
+        
+        .tab-button:hover {
+            background: #e9ecef;
+            color: #333;
+        }
+        
+        .tab-button.active {
+            color: #667eea;
+            border-bottom-color: #667eea;
+            background: white;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
         }
         
         .content {
@@ -648,62 +983,171 @@ def get_main_html():
             <p>Import your Snapchat Memories to Immich with metadata preservation</p>
         </div>
         
-        <div class="content">
-            <!-- Upload Section -->
-            <div class="section">
-                <div class="section-title">1. Upload Snapchat Export</div>
-                <div class="upload-area" id="uploadArea">
-                    <div class="upload-icon">📁</div>
-                    <p style="margin-bottom: 8px;">
-                        <strong>Drag & drop your file here</strong>
+        <!-- Tab Navigation -->
+        <div class="tabs">
+            <button class="tab-button active" onclick="switchTab('import')">
+                Import New
+            </button>
+            <button class="tab-button" onclick="switchTab('repair')">
+                Repair Immich
+            </button>
+            <button class="tab-button" onclick="switchTab('process')">
+                Process Only
+            </button>
+        </div>
+        
+        <!-- Tab Content: Import -->
+        <div class="tab-content active" id="importTab">
+            <div class="content">
+                <!-- Upload Section -->
+                <div class="section">
+                    <div class="section-title">1. Upload Snapchat Export</div>
+                    <div class="upload-area" id="uploadArea">
+                        <div class="upload-icon">📁</div>
+                        <p style="margin-bottom: 8px;">
+                            <strong>Drag & drop your file here</strong>
+                        </p>
+                        <p style="color: #666; font-size: 14px;">
+                            or click to browse (JSON or HTML)
+                        </p>
+                        <input type="file" id="fileInput" accept=".json,.html" style="display: none;">
+                    </div>
+                    <div id="uploadAlert" class="alert"></div>
+                    <div id="uploadedFile" style="margin-top: 15px; display: none;">
+                        <strong>Selected file:</strong> <span id="fileName"></span>
+                    </div>
+                </div>
+                
+                <!-- Configuration Section -->
+                <div class="section">
+                    <div class="section-title">2. Configure Immich Settings</div>
+                    <div class="form-group">
+                        <label for="immichUrl">Immich Server URL</label>
+                        <input type="text" id="immichUrl" placeholder="http://localhost:2283/api">
+                    </div>
+                    <div class="form-group">
+                        <label for="apiKey">Immich API Key</label>
+                        <input type="password" id="apiKey" placeholder="Your API key from Immich settings">
+                    </div>
+                    <div class="form-group">
+                        <label for="delay">Download Delay (seconds)</label>
+                        <input type="number" id="delay" value="2.0" min="0.5" step="0.5">
+                    </div>
+                    <div class="checkbox-group">
+                        <input type="checkbox" id="skipUpload">
+                        <label for="skipUpload" style="margin-bottom: 0;">Skip Immich upload (process only)</label>
+                    </div>
+                </div>
+                
+                <!-- Start Import Button -->
+                <div class="section">
+                    <button class="btn" id="startBtn" disabled>Upload a file to start</button>
+                </div>
+                
+                <!-- Progress Section -->
+                <div class="progress-section" id="progressSection">
+                    <div class="section-title">Import Progress</div>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar" id="progressBar" style="width: 0%">0%</div>
+                    </div>
+                    <div id="statusMessages"></div>
+                    <div id="statsSection" style="display: none;">
+                        <div class="section-title">Import Statistics</div>
+                        <div class="stats-grid" id="statsGrid"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Tab Content: Repair Immich -->
+        <div class="tab-content" id="repairTab">
+            <div class="content">
+                <div class="section">
+                    <div class="section-title">Repair Metadata in Immich</div>
+                    <p style="color: #666; margin-bottom: 20px;">
+                        Fix GPS coordinates and dates for photos already uploaded to Immich
                     </p>
-                    <p style="color: #666; font-size: 14px;">
-                        or click to browse (JSON or HTML)
+                    
+                    <div class="form-group">
+                        <label for="repairMetadataFile">Metadata JSON File</label>
+                        <select id="repairMetadataFile">
+                            <option value="">-- Select metadata file --</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="repairImmichUrl">Immich Server URL</label>
+                        <input type="text" id="repairImmichUrl" placeholder="http://localhost:2283/api">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="repairApiKey">Immich API Key</label>
+                        <input type="password" id="repairApiKey" placeholder="Your API key">
+                    </div>
+                    
+                    <div style="display: flex; gap: 10px;">
+                        <button class="btn" id="checkMetadataBtn" style="flex: 1;">
+                            Check Metadata (Dry Run)
+                        </button>
+                        <button class="btn" id="applyFixesBtn" style="flex: 1;">
+                            Apply Fixes
+                        </button>
+                    </div>
+                </div>
+                
+                <div class="progress-section" id="repairProgressSection">
+                    <div class="section-title">Repair Progress</div>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar" id="repairProgressBar" style="width: 0%">0%</div>
+                    </div>
+                    <div id="repairStatusMessages"></div>
+                    <div id="repairStatsSection" style="display: none;">
+                        <div class="stats-grid" id="repairStatsGrid"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Tab Content: Process Only -->
+        <div class="tab-content" id="processTab">
+            <div class="content">
+                <div class="section">
+                    <div class="section-title">Process Already Downloaded Files</div>
+                    <p style="color: #666; margin-bottom: 20px;">
+                        Process files that are already downloaded (skips download phase)
                     </p>
-                    <input type="file" id="fileInput" accept=".json,.html" style="display: none;">
+                    
+                    <div class="form-group">
+                        <label for="processMetadataFile">Metadata JSON File</label>
+                        <select id="processMetadataFile">
+                            <option value="">-- Select metadata file --</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="processImmichUrl">Immich Server URL (optional)</label>
+                        <input type="text" id="processImmichUrl" placeholder="http://localhost:2283/api">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="processApiKey">Immich API Key (optional)</label>
+                        <input type="password" id="processApiKey" placeholder="Leave empty to skip upload">
+                    </div>
+                    
+                    <button class="btn" id="processStartBtn">
+                        Start Processing
+                    </button>
                 </div>
-                <div id="uploadAlert" class="alert"></div>
-                <div id="uploadedFile" style="margin-top: 15px; display: none;">
-                    <strong>Selected file:</strong> <span id="fileName"></span>
-                </div>
-            </div>
-            
-            <!-- Configuration Section -->
-            <div class="section">
-                <div class="section-title">2. Configure Immich Settings</div>
-                <div class="form-group">
-                    <label for="immichUrl">Immich Server URL</label>
-                    <input type="text" id="immichUrl" placeholder="http://localhost:2283/api">
-                </div>
-                <div class="form-group">
-                    <label for="apiKey">Immich API Key</label>
-                    <input type="password" id="apiKey" placeholder="Your API key from Immich settings">
-                </div>
-                <div class="form-group">
-                    <label for="delay">Download Delay (seconds)</label>
-                    <input type="number" id="delay" value="2.0" min="0.5" step="0.5">
-                </div>
-                <div class="checkbox-group">
-                    <input type="checkbox" id="skipUpload">
-                    <label for="skipUpload" style="margin-bottom: 0;">Skip Immich upload (process only)</label>
-                </div>
-            </div>
-            
-            <!-- Start Import Button -->
-            <div class="section">
-                <button class="btn" id="startBtn" disabled>Upload a file to start</button>
-            </div>
-            
-            <!-- Progress Section -->
-            <div class="progress-section" id="progressSection">
-                <div class="section-title">Import Progress</div>
-                <div class="progress-bar-container">
-                    <div class="progress-bar" id="progressBar" style="width: 0%">0%</div>
-                </div>
-                <div id="statusMessages"></div>
-                <div id="statsSection" style="display: none;">
-                    <div class="section-title">Import Statistics</div>
-                    <div class="stats-grid" id="statsGrid"></div>
+                
+                <div class="progress-section" id="processProgressSection">
+                    <div class="section-title">Processing Progress</div>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar" id="processProgressBar" style="width: 0%">0%</div>
+                    </div>
+                    <div id="processStatusMessages"></div>
+                    <div id="processStatsSection" style="display: none;">
+                        <div class="stats-grid" id="processStatsGrid"></div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -713,6 +1157,55 @@ def get_main_html():
         let uploadedFilename = null;
         let ws = null;
         let currentJobId = null;
+        
+        // Tab switching
+        function switchTab(tabName) {
+            // Hide all tabs
+            document.querySelectorAll('.tab-content').forEach(tab => {
+                tab.classList.remove('active');
+            });
+            document.querySelectorAll('.tab-button').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            
+            // Show selected tab
+            document.getElementById(tabName + 'Tab').classList.add('active');
+            event.target.classList.add('active');
+            
+            // Load metadata files for repair and process tabs
+            if (tabName === 'repair' || tabName === 'process') {
+                loadMetadataFiles();
+            }
+        }
+        
+        // Load available metadata files
+        async function loadMetadataFiles() {
+            try {
+                const response = await fetch('/api/metadata/list');
+                const data = await response.json();
+                
+                const repairSelect = document.getElementById('repairMetadataFile');
+                const processSelect = document.getElementById('processMetadataFile');
+                
+                // Clear existing options (except first)
+                repairSelect.innerHTML = '<option value="">-- Select metadata file --</option>';
+                processSelect.innerHTML = '<option value="">-- Select metadata file --</option>';
+                
+                data.files.forEach(file => {
+                    const option1 = document.createElement('option');
+                    option1.value = file.filename;
+                    option1.textContent = `${file.filename} (${(file.size / 1024).toFixed(1)} KB)`;
+                    repairSelect.appendChild(option1);
+                    
+                    const option2 = document.createElement('option');
+                    option2.value = file.filename;
+                    option2.textContent = `${file.filename} (${(file.size / 1024).toFixed(1)} KB)`;
+                    processSelect.appendChild(option2);
+                });
+            } catch (error) {
+                console.error('Failed to load metadata files:', error);
+            }
+        }
         
         // Initialize WebSocket
         function initWebSocket() {
@@ -740,17 +1233,44 @@ def get_main_html():
         function handleWebSocketMessage(data) {
             if (data.job_id !== currentJobId) return;
             
+            // Determine job type from job_id prefix
+            const jobType = data.job_id.split('_')[0]; // 'import', 'repair', or 'process'
+            
             if (data.type === 'progress') {
-                updateProgress(data.progress, data.message);
-            } else if (data.type === 'complete') {
-                updateProgress(100, data.message);
-                if (data.stats) {
-                    displayStats(data.stats);
+                if (jobType === 'repair') {
+                    updateRepairProgress(data.progress, data.message);
+                } else if (jobType === 'process') {
+                    updateProcessProgress(data.progress, data.message);
+                } else {
+                    updateProgress(data.progress, data.message);
                 }
-                document.getElementById('startBtn').disabled = false;
+            } else if (data.type === 'complete') {
+                if (jobType === 'repair') {
+                    updateRepairProgress(100, data.message);
+                    if (data.stats) {
+                        displayRepairStats(data.stats);
+                    }
+                } else if (jobType === 'process') {
+                    updateProcessProgress(100, data.message);
+                    if (data.stats) {
+                        displayProcessStats(data.stats);
+                    }
+                } else {
+                    updateProgress(100, data.message);
+                    if (data.stats) {
+                        displayStats(data.stats);
+                    }
+                    document.getElementById('startBtn').disabled = false;
+                }
             } else if (data.type === 'error') {
-                showStatus('error', data.message);
-                document.getElementById('startBtn').disabled = false;
+                if (jobType === 'repair') {
+                    addRepairStatusMessage('error', data.message);
+                } else if (jobType === 'process') {
+                    addProcessStatusMessage('error', data.message);
+                } else {
+                    showStatus('error', data.message);
+                    document.getElementById('startBtn').disabled = false;
+                }
             }
         }
         
@@ -915,12 +1435,197 @@ def get_main_html():
         // Initialize
         initWebSocket();
         
+        // Repair Immich handlers
+        document.getElementById('checkMetadataBtn').addEventListener('click', () => startRepair(true));
+        document.getElementById('applyFixesBtn').addEventListener('click', () => startRepair(false));
+        
+        async function startRepair(dryRun) {
+            const metadataFile = document.getElementById('repairMetadataFile').value;
+            const immichUrl = document.getElementById('repairImmichUrl').value;
+            const apiKey = document.getElementById('repairApiKey').value;
+            
+            if (!metadataFile) {
+                alert('Please select a metadata file');
+                return;
+            }
+            
+            if (!immichUrl || !apiKey) {
+                alert('Please enter Immich URL and API key');
+                return;
+            }
+            
+            try {
+                document.getElementById('repairProgressSection').classList.add('active');
+                document.getElementById('repairStatusMessages').innerHTML = '';
+                document.getElementById('repairStatsSection').style.display = 'none';
+                updateRepairProgress(0, dryRun ? 'Starting dry run...' : 'Starting repair...');
+                
+                const response = await fetch('/api/repair/start', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        metadata_file: metadataFile,
+                        immich_url: immichUrl,
+                        api_key: apiKey,
+                        dry_run: dryRun
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Failed to start repair');
+                }
+                
+                const data = await response.json();
+                currentJobId = data.job_id;
+                addRepairStatusMessage('info', `Repair job started: ${data.job_id}`);
+            } catch (error) {
+                addRepairStatusMessage('error', `Failed to start repair: ${error.message}`);
+            }
+        }
+        
+        function updateRepairProgress(percent, message) {
+            const progressBar = document.getElementById('repairProgressBar');
+            progressBar.style.width = `${percent}%`;
+            progressBar.textContent = `${percent}%`;
+            
+            if (message) {
+                addRepairStatusMessage('info', message);
+            }
+        }
+        
+        function addRepairStatusMessage(type, message) {
+            const messagesDiv = document.getElementById('repairStatusMessages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `status-message ${type}`;
+            messageDiv.textContent = message;
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+        
+        function displayRepairStats(stats) {
+            const statsSection = document.getElementById('repairStatsSection');
+            const statsGrid = document.getElementById('repairStatsGrid');
+            
+            statsGrid.innerHTML = '';
+            
+            if (stats) {
+                addRepairStatCard('Checked', stats.checked);
+                addRepairStatCard('Needs Repair', stats.needs_repair);
+                if (!stats.dry_run) {
+                    addRepairStatCard('Repaired', stats.repaired);
+                }
+            }
+            
+            statsSection.style.display = 'block';
+        }
+        
+        function addRepairStatCard(label, value) {
+            const statsGrid = document.getElementById('repairStatsGrid');
+            const card = document.createElement('div');
+            card.className = 'stat-card';
+            card.innerHTML = `
+                <div class="stat-value">${value}</div>
+                <div class="stat-label">${label}</div>
+            `;
+            statsGrid.appendChild(card);
+        }
+        
+        // Process Only handler
+        document.getElementById('processStartBtn').addEventListener('click', async () => {
+            const metadataFile = document.getElementById('processMetadataFile').value;
+            const immichUrl = document.getElementById('processImmichUrl').value;
+            const apiKey = document.getElementById('processApiKey').value;
+            
+            if (!metadataFile) {
+                alert('Please select a metadata file');
+                return;
+            }
+            
+            try {
+                document.getElementById('processProgressSection').classList.add('active');
+                document.getElementById('processStatusMessages').innerHTML = '';
+                document.getElementById('processStatsSection').style.display = 'none';
+                updateProcessProgress(0, 'Starting processing...');
+                
+                const response = await fetch('/api/process/start', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        metadata_file: metadataFile,
+                        immich_url: immichUrl || null,
+                        api_key: apiKey || null
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Failed to start processing');
+                }
+                
+                const data = await response.json();
+                currentJobId = data.job_id;
+                addProcessStatusMessage('info', `Processing job started: ${data.job_id}`);
+            } catch (error) {
+                addProcessStatusMessage('error', `Failed to start processing: ${error.message}`);
+            }
+        });
+        
+        function updateProcessProgress(percent, message) {
+            const progressBar = document.getElementById('processProgressBar');
+            progressBar.style.width = `${percent}%`;
+            progressBar.textContent = `${percent}%`;
+            
+            if (message) {
+                addProcessStatusMessage('info', message);
+            }
+        }
+        
+        function addProcessStatusMessage(type, message) {
+            const messagesDiv = document.getElementById('processStatusMessages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `status-message ${type}`;
+            messageDiv.textContent = message;
+            messagesDiv.appendChild(messageDiv);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+        
+        function displayProcessStats(stats) {
+            const statsSection = document.getElementById('processStatsSection');
+            const statsGrid = document.getElementById('processStatsGrid');
+            
+            statsGrid.innerHTML = '';
+            
+            if (stats.summary) {
+                addProcessStatCard('Total Files', stats.summary.total_files);
+                addProcessStatCard('With GPS', stats.summary.with_gps);
+                addProcessStatCard('GPS Coverage', `${stats.summary.gps_coverage_percent}%`);
+            }
+            
+            if (stats.file_sizes) {
+                addProcessStatCard('Total Size', `${stats.file_sizes.total_mb} MB`);
+            }
+            
+            statsSection.style.display = 'block';
+        }
+        
+        function addProcessStatCard(label, value) {
+            const statsGrid = document.getElementById('processStatsGrid');
+            const card = document.createElement('div');
+            card.className = 'stat-card';
+            card.innerHTML = `
+                <div class="stat-value">${value}</div>
+                <div class="stat-label">${label}</div>
+            `;
+            statsGrid.appendChild(card);
+        }
+        
         // Load config on page load
         fetch('/api/config')
             .then(r => r.json())
             .then(config => {
                 if (config.immich && config.immich.url) {
                     document.getElementById('immichUrl').value = config.immich.url;
+                    document.getElementById('repairImmichUrl').value = config.immich.url;
+                    document.getElementById('processImmichUrl').value = config.immich.url;
                 }
                 if (config.download && config.download.delay) {
                     document.getElementById('delay').value = config.download.delay;
