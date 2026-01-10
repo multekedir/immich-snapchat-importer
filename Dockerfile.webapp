@@ -19,12 +19,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY webapp.py .
+COPY webapp_html.py .
 COPY process_memories.py .
 COPY repair_immich_metadata.py .
 COPY config.yaml* ./
 
 # Create necessary directories
-RUN mkdir -p /app/uploads /app/work
+RUN mkdir -p /app/uploads /app/work /app/static
+
+# Copy static files
+COPY static/ ./static/
 
 # Expose port
 EXPOSE 8000
