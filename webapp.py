@@ -1151,13 +1151,13 @@ def get_main_html():
         
         <!-- Tab Navigation -->
         <div class="tabs">
-            <button class="tab-button active" onclick="switchTab('import')">
+            <button class="tab-button active" onclick=\"switchTab('import', this)\">
                 Import New
             </button>
-            <button class="tab-button" onclick="switchTab('repair')">
+            <button class="tab-button" onclick=\"switchTab('repair', this)\">
                 Repair Immich
             </button>
-            <button class="tab-button" onclick="switchTab('process')">
+            <button class="tab-button" onclick=\"switchTab('process', this)\">
                 Process Only
             </button>
         </div>
@@ -1359,7 +1359,7 @@ def get_main_html():
         let currentJobId = null;
         
         // Tab switching
-        function switchTab(tabName) {
+        function switchTab(tabName, buttonElement) {
             // Hide all tabs
             document.querySelectorAll('.tab-content').forEach(tab => {
                 tab.classList.remove('active');
@@ -1369,8 +1369,15 @@ def get_main_html():
             });
             
             // Show selected tab
-            document.getElementById(tabName + 'Tab').classList.add('active');
-            event.target.classList.add('active');
+            const tabContent = document.getElementById(tabName + 'Tab');
+            if (tabContent) {
+                tabContent.classList.add('active');
+            }
+            
+            // Activate the clicked button
+            if (buttonElement) {
+                buttonElement.classList.add('active');
+            }
             
             // Load metadata files for repair and process tabs
             if (tabName === 'repair' || tabName === 'process') {
@@ -1686,8 +1693,6 @@ def get_main_html():
             } catch (error) {
                 addRepairStatusMessage('error', `Failed to start repair: ${error.message}`);
             }
-        }
-        
         }
         
         function addRepairStatusMessage(type, message) {
