@@ -107,9 +107,12 @@ class ImmichMetadataRepairer:
         with open(metadata_file) as f:
             metadata = json.load(f)
         
+        self.metadata = metadata  # Store full metadata for better matching
+        
         # Create lookup dictionaries
         self.metadata_lookup = {}
         self.metadata_by_date = {}
+        self.metadata_by_index = {}
         
         for memory in metadata.get('memories', []):
             if 'filename' in memory:
@@ -117,7 +120,94 @@ class ImmichMetadataRepairer:
                 self.metadata_lookup[filename_base] = memory
             
             if 'date_key' in memory:
-                self.metadata_by_date[memory['date_key']] = memory
+                # Store list of memories by date_key (there can be multiple)
+                if memory['date_key'] not in self.metadata_by_date:
+                    self.metadata_by_date[memory['date_key']] = []
+                self.metadata_by_date[memory['date_key']].append(memory)
+            
+            if 'index' in memory:
+                self.metadata_by_index[memory['index']] = memory
+    
+    def search_asset_by_filename(self, filename_base):
+        """Search for an asset in Immich by filename (without extension)
+        
+        Args:
+            filename_base: Filename without extension (e.g., "2025-12-22_03-07-53_video_0021_gps")
+        
+        Returns:
+            Asset dict if found, None otherwise
+        """
+        # Try different extensions
+        extensions = ['.mp4', '.jpg', '.jpeg', '.png', '.mov', '.avi', '.mkv']
+        
+        for ext in extensions:
+            filename = f"{filename_base}{ext}"
+            
+            # Try searching by filename using search endpoint
+            try:
+                # Try search with filename filter
+                response = requests.post(
+                    f"{self.immich_url}/search",
+                    headers=self.headers,
+                    json={
+                        "withArchived": False,
+                        "searchTerm": filename_base  # Search by base name
+                    },
+                    timeout=10
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    assets = data.get('items', data.get('results', data.get('assets', [])))
+                    
+                    # Look for exact filename match
+                    for asset in assets:
+                        asset_filename = asset.get('originalFileName') or asset.get('originalPath', '')
+                        if asset_filename and filename_base in asset_filename:
+                            # Check if it matches (with or without extension)
+                            asset_base = Path(asset_filename).stem
+                            if asset_base == filename_base:
+                                return asset
+            except Exception as e:
+                logger.debug(f"Search error for {filename}: {e}")
+                continue
+        
+        # Fallback: try searching by date pattern if filename has date
+        date_match = re.search(r'(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})', filename_base)
+        if date_match:
+            date_key = date_match.group(1)
+            try:
+                # Try timeline/bucket for that date
+                response = requests.get(
+                    f"{self.immich_url}/timeline/bucket",
+                    headers=self.headers,
+                    params={"size": "DAY", "timeBucket": date_key.split('_')[0]},  # Just the date part
+                    timeout=10
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    # The response structure varies, try to find assets
+                    assets = []
+                    if isinstance(data, dict):
+                        if 'assets' in data and isinstance(data['assets'], list):
+                            assets = data['assets']
+                        elif 'buckets' in data:
+                            for bucket in data.get('buckets', []):
+                                if 'assets' in bucket:
+                                    assets.extend(bucket['assets'])
+                    
+                    # Look for matching filename
+                    for asset in assets:
+                        asset_filename = asset.get('originalFileName') or asset.get('originalPath', '')
+                        if asset_filename:
+                            asset_base = Path(asset_filename).stem
+                            if asset_base == filename_base:
+                                return asset
+            except Exception as e:
+                logger.debug(f"Timeline search error for {filename_base}: {e}")
+        
+        return None
     
     def get_all_assets(self):
         """Fetch all assets from Immich"""
@@ -125,95 +215,325 @@ class ImmichMetadataRepairer:
         logger.info("FETCHING ASSETS FROM IMMICH")
         logger.info("=" * 80)
         
+        all_assets = []
+        
         try:
-            # Get all assets using the search endpoint
-            response = requests.get(
-                f"{self.immich_url}/asset",
+            # Try timeline/bucket endpoint (Immich v1 API)
+            # This endpoint returns assets grouped by time bucket - need to fetch multiple time buckets
+            logger.info("   Trying timeline/bucket endpoint...")
+            # Try getting assets for different time buckets (recent dates)
+            from datetime import datetime, timedelta
+            today = datetime.now()
+            for days_back in range(365):  # Check last year
+                date_str = (today - timedelta(days=days_back)).strftime('%Y-%m-%d')
+                response = requests.get(
+                    f"{self.immich_url}/timeline/bucket",
+                    headers=self.headers,
+                    params={"size": "DAY", "timeBucket": date_str},
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    # Timeline bucket returns dict with bucket data
+                    if isinstance(data, dict):
+                        # Look for assets in the response structure
+                        if 'assets' in data and isinstance(data['assets'], list):
+                            all_assets.extend(data['assets'])
+                        elif 'buckets' in data:
+                            for bucket in data['buckets']:
+                                if 'assets' in bucket and isinstance(bucket['assets'], list):
+                                    all_assets.extend(bucket['assets'])
+                        # If data itself is a list or contains items directly
+                        elif isinstance(data, list):
+                            all_assets.extend(data)
+                        elif 'items' in data:
+                            all_assets.extend(data['items'])
+                
+                # If we got assets, we can break early (this was just a test)
+                # Actually, let's fetch all time buckets for completeness
+                if days_back > 10 and len(all_assets) > 0:
+                    # For efficiency, just check recent dates, but user can extend if needed
+                    break
+            
+            if all_assets:
+                # Remove duplicates based on asset ID
+                seen_ids = set()
+                unique_assets = []
+                for asset in all_assets:
+                    asset_id = asset.get('id') or asset.get('assetId')
+                    if asset_id and asset_id not in seen_ids:
+                        seen_ids.add(asset_id)
+                        unique_assets.append(asset)
+                logger.info(f"✓ Found {len(unique_assets)} unique assets using timeline/bucket")
+                return unique_assets
+            
+            # Try search endpoint (Immich v1 API)
+            logger.info("   Trying search endpoint...")
+            response = requests.post(
+                f"{self.immich_url}/search",
                 headers=self.headers,
+                json={"withArchived": False},
                 timeout=30
             )
             
-            if response.status_code != 200:
-                logger.error(f"❌ Failed to fetch assets: {response.status_code}")
-                logger.error(f"   Response: {response.text[:200]}")
-                return []
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, dict):
+                    all_assets = data.get('items', data.get('results', data.get('assets', [])))
+                elif isinstance(data, list):
+                    all_assets = data
+                
+                if all_assets:
+                    logger.info(f"✓ Found {len(all_assets)} assets using search")
+                    return all_assets
             
-            assets = response.json()
-            logger.info(f"✓ Found {len(assets)} assets in Immich")
-            return assets
+            # Try asset endpoint with pagination
+            logger.info("   Trying asset endpoint with pagination...")
+            page = 1
+            while True:
+                response = requests.get(
+                    f"{self.immich_url}/asset",
+                    headers=self.headers,
+                    params={"page": page, "size": 1000},
+                    timeout=30
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if isinstance(data, dict):
+                        page_assets = data.get('items', data.get('data', []))
+                        if not page_assets:
+                            break
+                        all_assets.extend(page_assets)
+                        
+                        # Check if there are more pages
+                        if len(page_assets) < 1000:
+                            break
+                        page += 1
+                    elif isinstance(data, list):
+                        all_assets = data
+                        break
+                    else:
+                        break
+                else:
+                    break
+            
+            if all_assets:
+                logger.info(f"✓ Found {len(all_assets)} assets using asset endpoint")
+                return all_assets
+            
+            logger.error(f"❌ Failed to fetch assets")
+            logger.error(f"   Tried endpoints: /timeline/bucket (GET), /search (POST), /asset (GET)")
+            logger.error(f"   Last response status: {response.status_code if 'response' in locals() else 'N/A'}")
+            if 'response' in locals() and response.status_code != 200:
+                logger.error(f"   Response: {response.text[:200]}")
+            return []
         
         except Exception as e:
             logger.error(f"❌ Error fetching assets: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return []
     
     def check_asset_metadata(self, asset):
         """Check if asset metadata matches Snapchat metadata"""
+        # Get filename from asset - try multiple fields
         original_path = asset.get('originalPath', '')
-        original_filename = Path(original_path).stem if original_path else asset.get('originalFileName', '')
+        original_filename = asset.get('originalFileName', '')
         
-        # Try to find matching metadata
-        memory = self.metadata_lookup.get(original_filename)
+        # Always strip extension for matching (metadata has no extensions)
+        if original_path:
+            filename_base = Path(original_path).stem
+        elif original_filename:
+            filename_base = Path(original_filename).stem
+        else:
+            # Fallback: try to extract from any filename field
+            filename_base = asset.get('name', '').replace('.mp4', '').replace('.jpg', '').replace('.jpeg', '').replace('.png', '')
         
-        # Fallback: try date matching
+        # Try to find matching metadata by exact filename match
+        memory = self.metadata_lookup.get(filename_base)
+        
+        # Fallback 1: try date matching with full pattern matching
         if not memory:
-            date_match = re.search(r'(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})', original_filename)
+            date_match = re.search(r'(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})', filename_base)
             if date_match:
                 date_key = date_match.group(1)
-                memory = self.metadata_by_date.get(date_key)
+                # Try to find memories with matching date_key
+                potential_memories = [m for m in self.metadata.get('memories', []) if m.get('date_key') == date_key]
+                
+                if potential_memories:
+                    # Try to match by extracting components from filename: date_key_media_type_####_gps
+                    # Example: "2025-12-22_03-07-53_video_0021_gps"
+                    pattern_match = re.search(r'(\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2})_(\w+)_(\d{4})(_gps)?', filename_base)
+                    if pattern_match:
+                        _, media_type_str, index_str, has_gps = pattern_match.groups()
+                        file_index = int(index_str) if index_str else None
+                        
+                        # Try to match by index first (most accurate)
+                        if file_index:
+                            for pm in potential_memories:
+                                if pm.get('index') == file_index:
+                                    memory = pm
+                                    break
+                        
+                        # Fallback: match by media type and GPS flag
+                        if not memory and file_index is None:
+                            for pm in potential_memories:
+                                pm_media_type = pm.get('media_type', '').lower()
+                                pm_has_gps = pm.get('location', {}).get('valid', False)
+                                file_has_gps = bool(has_gps)
+                                
+                                if (pm_media_type == media_type_str.lower() and 
+                                    pm_has_gps == file_has_gps):
+                                    memory = pm
+                                    break
+                    
+                    # Last resort: if only one match for this date, use it
+                    if not memory and len(potential_memories) == 1:
+                        memory = potential_memories[0]
+                    # Or try matching by media type only
+                    elif not memory:
+                        media_type_match = re.search(r'(video|photo|image)', filename_base, re.IGNORECASE)
+                        if media_type_match:
+                            media_type = media_type_match.group(1).lower()
+                            for pm in potential_memories:
+                                if pm.get('media_type', '').lower() == media_type:
+                                    memory = pm
+                                    break
+        
+        # Fallback 2: try matching by index from filename pattern
+        if not memory:
+            # Extract index from filename like "video_0021" or "photo_0005"
+            index_match = re.search(r'_(\d{4})(_|$)', filename_base)
+            if index_match:
+                file_index = int(index_match.group(1))
+                memory = self.metadata_by_index.get(file_index)
         
         if not memory:
             return None, None
         
-        # Check date
+        # Check date - use date_utc if available, fallback to date_pst
         date_correct = False
-        if 'date_pst' in memory:
-            expected_date = memory['date_pst']
-            asset_date = asset.get('fileCreatedAt', '')
-            
-            # Compare dates (allow small differences)
-            if expected_date and asset_date:
-                try:
-                    expected_dt = datetime.fromisoformat(expected_date.replace('Z', ''))
-                    asset_dt = datetime.fromisoformat(asset_date.replace('Z', ''))
-                    
-                    # Allow up to 1 minute difference
-                    date_diff = abs((expected_dt - asset_dt).total_seconds())
-                    date_correct = date_diff < 60
-                except:
-                    pass
+        expected_date = memory.get('date_utc') or memory.get('date_pst')
+        asset_date = asset.get('fileCreatedAt') or asset.get('createdAt') or asset.get('dateTimeOriginal', '')
+        
+        # Log for debugging
+        logger.debug(f"     Expected date: {expected_date}, Asset date: {asset_date}")
+        
+        # Compare dates (allow small differences)
+        if expected_date and asset_date:
+            try:
+                # Normalize both dates for comparison
+                expected_dt = datetime.fromisoformat(expected_date.replace('Z', '+00:00').replace('+00:00', ''))
+                asset_dt = datetime.fromisoformat(asset_date.replace('Z', '+00:00').replace('+00:00', ''))
+                
+                # Allow up to 1 minute difference
+                date_diff = abs((expected_dt - asset_dt).total_seconds())
+                date_correct = date_diff < 60
+                logger.debug(f"     Date diff: {date_diff:.1f} seconds, Correct: {date_correct}")
+            except Exception as e:
+                logger.debug(f"     Date comparison error: {e}")
+                # If date comparison fails, assume it needs fixing
+                date_correct = False
+        else:
+            # If we can't compare dates, assume it needs fixing
+            if expected_date:
+                logger.debug(f"     No asset date found, assuming needs fix")
+            date_correct = False
         
         # Check GPS
         gps_correct = False
-        exif_info = asset.get('exifInfo', {})
+        exif_info = asset.get('exifInfo') or asset.get('exif') or {}
         
         if 'location' in memory and memory['location'].get('valid'):
             expected_lat = memory['location']['latitude']
             expected_lon = memory['location']['longitude']
             
-            asset_lat = exif_info.get('latitude')
-            asset_lon = exif_info.get('longitude')
+            asset_lat = exif_info.get('latitude') or asset.get('latitude')
+            asset_lon = exif_info.get('longitude') or asset.get('longitude')
+            
+            logger.debug(f"     Expected GPS: ({expected_lat}, {expected_lon}), Asset GPS: ({asset_lat}, {asset_lon})")
             
             if asset_lat is not None and asset_lon is not None:
                 # Allow small GPS differences (within 0.0001 degrees ~10m)
-                gps_correct = (
-                    abs(float(asset_lat) - expected_lat) < 0.0001 and
-                    abs(float(asset_lon) - expected_lon) < 0.0001
-                )
+                lat_diff = abs(float(asset_lat) - expected_lat)
+                lon_diff = abs(float(asset_lon) - expected_lon)
+                gps_correct = lat_diff < 0.0001 and lon_diff < 0.0001
+                logger.debug(f"     GPS diff: ({lat_diff:.6f}, {lon_diff:.6f}), Correct: {gps_correct}")
+            else:
+                logger.debug(f"     Asset has no GPS data, needs fix")
+                gps_correct = False
         else:
-            # If no GPS expected, consider it correct if asset also has no GPS
-            gps_correct = exif_info.get('latitude') is None
+            # If no GPS expected in metadata, consider it correct if asset also has no GPS
+            asset_lat = exif_info.get('latitude') or asset.get('latitude')
+            gps_correct = asset_lat is None
+            logger.debug(f"     No GPS expected, asset GPS: {asset_lat}, Correct: {gps_correct}")
         
         needs_fix = not (date_correct and gps_correct)
+        logger.debug(f"     Needs fix: {needs_fix} (date_correct: {date_correct}, gps_correct: {gps_correct})")
         
         return memory, needs_fix
+    
+    def asset_needs_fixing(self, asset, memory):
+        """Check if an asset needs fixing given its expected metadata
+        
+        Args:
+            asset: Asset dict from Immich
+            memory: Memory dict from metadata file
+        
+        Returns:
+            bool: True if asset needs fixing, False otherwise
+        """
+        # Check date - use date_utc if available, fallback to date_pst
+        expected_date = memory.get('date_utc') or memory.get('date_pst')
+        asset_date = asset.get('fileCreatedAt') or asset.get('createdAt') or asset.get('dateTimeOriginal', '')
+        
+        date_correct = False
+        if expected_date and asset_date:
+            try:
+                expected_dt = datetime.fromisoformat(expected_date.replace('Z', '+00:00').replace('+00:00', ''))
+                asset_dt = datetime.fromisoformat(asset_date.replace('Z', '+00:00').replace('+00:00', ''))
+                date_diff = abs((expected_dt - asset_dt).total_seconds())
+                date_correct = date_diff < 60
+            except:
+                date_correct = False
+        else:
+            if expected_date:
+                date_correct = False  # Expected date but asset has none
+        
+        # Check GPS
+        gps_correct = False
+        exif_info = asset.get('exifInfo') or asset.get('exif') or {}
+        
+        if 'location' in memory and memory['location'].get('valid'):
+            expected_lat = memory['location']['latitude']
+            expected_lon = memory['location']['longitude']
+            
+            asset_lat = exif_info.get('latitude') or asset.get('latitude')
+            asset_lon = exif_info.get('longitude') or asset.get('longitude')
+            
+            if asset_lat is not None and asset_lon is not None:
+                lat_diff = abs(float(asset_lat) - expected_lat)
+                lon_diff = abs(float(asset_lon) - expected_lon)
+                gps_correct = lat_diff < 0.0001 and lon_diff < 0.0001
+            else:
+                gps_correct = False  # Expected GPS but asset has none
+        else:
+            # If no GPS expected in metadata, consider it correct if asset also has no GPS
+            asset_lat = exif_info.get('latitude') or asset.get('latitude')
+            gps_correct = asset_lat is None
+        
+        return not (date_correct and gps_correct)
     
     def update_asset_metadata(self, asset_id, memory):
         """Update asset metadata in Immich"""
         updates = {}
         
-        # Update date (PST)
-        if 'date_pst' in memory:
-            updates['fileCreatedAt'] = memory['date_pst']
+        # Update date - use date_utc if available, fallback to date_pst
+        expected_date = memory.get('date_utc') or memory.get('date_pst')
+        if expected_date:
+            updates['fileCreatedAt'] = expected_date
         
         # Update GPS
         if 'location' in memory and memory['location'].get('valid'):
@@ -237,8 +557,13 @@ class ImmichMetadataRepairer:
             logger.error(f"      ✗ Update failed: {e}")
             return False
     
-    def repair_all(self, dry_run=False):
-        """Repair metadata for all assets"""
+    def repair_all(self, dry_run=False, progress_callback=None):
+        """Repair metadata for all assets
+        
+        Args:
+            dry_run: If True, don't make changes
+            progress_callback: Optional callback function(progress, message, details) for progress updates
+        """
         logger.info("\n" + "=" * 80)
         if dry_run:
             logger.info("METADATA REPAIR - DRY RUN MODE")
@@ -248,54 +573,163 @@ class ImmichMetadataRepairer:
             logger.info("REPAIRING ASSET METADATA IN IMMICH")
             logger.info("=" * 80)
         
-        assets = self.get_all_assets()
-        if not assets:
-            logger.warning("⚠️  No assets found")
+        # Get all memories from metadata
+        memories = self.metadata.get('memories', [])
+        total_memories = len(memories)
+        
+        if not memories:
+            logger.warning("⚠️  No memories found in metadata file")
+            if progress_callback:
+                progress_callback(100, "⚠️  No memories found in metadata file", {"total": 0, "checked": 0, "needs_repair": 0})
             return 0, 0, 0
+        
+        logger.info(f"✓ Found {total_memories} memories in metadata file")
+        if progress_callback:
+            progress_callback(10, f"Found {total_memories} memories in metadata file. Searching Immich for each...", {"total": total_memories})
         
         checked = 0
         needs_repair = 0
         repaired = 0
         skipped = 0
+        not_found = 0
         
-        for i, asset in enumerate(assets, 1):
-            asset_id = asset['id']
-            filename = asset.get('originalFileName', 'unknown')
-            
-            logger.info(f"\n[{i}/{len(assets)}] {filename}")
-            
-            memory, needs_fix = self.check_asset_metadata(asset)
-            
-            if memory is None:
-                logger.info(f"  ⏭️  No metadata found in Snapchat export")
+        for i, memory in enumerate(memories, 1):
+            # Get filename from metadata
+            filename_base = memory.get('filename', '')
+            if not filename_base:
                 skipped += 1
                 continue
             
+            # Calculate progress (10-90% for checking memories)
+            progress = 10 + int((i / total_memories) * 80)
+            
+            logger.info(f"\n[{i}/{total_memories}] Searching for: {filename_base}")
+            
+            # Search for asset in Immich by filename
+            asset = self.search_asset_by_filename(filename_base)
+            
+            if not asset:
+                not_found += 1
+                logger.info(f"  ⏭️  Asset not found in Immich")
+                if progress_callback:
+                    progress_callback(progress, f"[{i}/{total_memories}] {filename_base}: ⏭️  Not found in Immich", {
+                        "filename": filename_base,
+                        "index": i,
+                        "total": total_memories,
+                        "found": False
+                    })
+                continue
+            
+            # Asset found - check if it needs fixing
+            asset_id = asset.get('id') or asset.get('assetId', 'unknown')
+            asset_filename = asset.get('originalFileName') or asset.get('originalPath', 'unknown')
+            
+            logger.info(f"  ✓ Found in Immich: {asset_filename}")
+            
+            # Check if asset needs fixing (we already have memory from metadata)
+            # We need to check if the asset's metadata matches the expected metadata
+            needs_fix = self.asset_needs_fixing(asset, memory)
             checked += 1
             
+            details = {
+                "filename": filename_base,
+                "asset_filename": asset_filename,
+                "index": i,
+                "total": total_memories,
+                "has_metadata": True,
+                "found_in_immich": True,
+                "needs_fix": False,
+                "date_issue": False,
+                "gps_issue": False
+            }
+            
+            # Re-check to get detailed info
+            expected_date = memory.get('date_utc') or memory.get('date_pst')
+            asset_date = asset.get('fileCreatedAt') or asset.get('createdAt') or asset.get('dateTimeOriginal', '')
+            exif_info = asset.get('exifInfo') or asset.get('exif') or {}
+            asset_lat = exif_info.get('latitude') or asset.get('latitude')
+            asset_lon = exif_info.get('longitude') or asset.get('longitude')
+            
+            date_correct = False
+            gps_correct = False
+            
+            if expected_date and asset_date:
+                try:
+                    expected_dt = datetime.fromisoformat(expected_date.replace('Z', '+00:00').replace('+00:00', ''))
+                    asset_dt = datetime.fromisoformat(asset_date.replace('Z', '+00:00').replace('+00:00', ''))
+                    date_diff = abs((expected_dt - asset_dt).total_seconds())
+                    date_correct = date_diff < 60
+                except:
+                    date_correct = False
+            
+            if 'location' in memory and memory['location'].get('valid'):
+                expected_lat = memory['location']['latitude']
+                expected_lon = memory['location']['longitude']
+                if asset_lat is not None and asset_lon is not None:
+                    lat_diff = abs(float(asset_lat) - expected_lat)
+                    lon_diff = abs(float(asset_lon) - expected_lon)
+                    gps_correct = lat_diff < 0.0001 and lon_diff < 0.0001
+                else:
+                    gps_correct = False
+            else:
+                gps_correct = asset_lat is None
+            
+            details.update({
+                "needs_fix": needs_fix,
+                "date_correct": date_correct,
+                "gps_correct": gps_correct,
+                "expected_date": expected_date,
+                "asset_date": asset_date,
+                "expected_gps": memory.get('location', {}).get('valid') and {
+                    "lat": memory['location']['latitude'],
+                    "lon": memory['location']['longitude']
+                } or None,
+                "asset_gps": {"lat": asset_lat, "lon": asset_lon} if asset_lat is not None else None
+            })
+            
             if not needs_fix:
-                logger.info(f"  ✓ Metadata is correct")
+                logger.info(f"  ✓ Metadata is correct (date: {'✓' if date_correct else '✗'}, GPS: {'✓' if gps_correct else '✗'})")
+                if progress_callback:
+                    progress_callback(progress, f"[{i}/{total_memories}] {filename_base}: ✓ Metadata is correct", details)
                 continue
             
             needs_repair += 1
+            details["date_issue"] = not date_correct
+            details["gps_issue"] = not gps_correct
             
             # Show what would be fixed
-            if 'date_pst' in memory:
-                logger.info(f"  📅 Date: {memory['date_pst']} (PST)")
-            
+            status_parts = []
+            if expected_date:
+                status_parts.append(f"📅 Date: {expected_date}")
+                if asset_date:
+                    status_parts.append(f"(current: {asset_date})")
             if 'location' in memory and memory['location'].get('valid'):
                 loc = memory['location']
-                logger.info(f"  📍 GPS: {loc['latitude']}, {loc['longitude']}")
+                status_parts.append(f"📍 GPS: {loc['latitude']}, {loc['longitude']}")
+                if asset_lat is not None:
+                    status_parts.append(f"(current: {asset_lat}, {asset_lon})")
+            
+            status_msg = " | ".join(status_parts) if status_parts else "Metadata needs update"
             
             if dry_run:
-                logger.info(f"  🔍 Would update metadata")
+                logger.info(f"  🔍 Would update metadata - {status_msg}")
+                if progress_callback:
+                    progress_callback(progress, f"[{i}/{total_memories}] {filename_base}: 🔍 Would fix - {status_msg}", details)
             else:
-                logger.info(f"  🔧 Updating metadata...")
+                logger.info(f"  🔧 Updating metadata... - {status_msg}")
+                if progress_callback:
+                    progress_callback(progress, f"[{i}/{total_memories}] {filename_base}: 🔧 Fixing - {status_msg}", details)
                 if self.update_asset_metadata(asset_id, memory):
                     logger.info(f"  ✓ Metadata updated")
                     repaired += 1
+                    if progress_callback:
+                        details["repaired"] = True
+                        progress_callback(progress, f"[{i}/{total_memories}] {filename_base}: ✓ Fixed successfully", details)
                 else:
                     logger.error(f"  ✗ Update failed")
+                    if progress_callback:
+                        details["repaired"] = False
+                        progress_callback(progress, f"[{i}/{total_memories}] {filename_base}: ✗ Update failed", details)
         
         logger.info("\n" + "=" * 80)
         if dry_run:
@@ -303,9 +737,10 @@ class ImmichMetadataRepairer:
         else:
             logger.info("REPAIR SUMMARY")
         logger.info("=" * 80)
-        logger.info(f"📊 Total assets: {len(assets)}")
-        logger.info(f"✓ Checked: {checked}")
-        logger.info(f"⏭️  Skipped (no metadata): {skipped}")
+        logger.info(f"📊 Total memories in metadata: {total_memories}")
+        logger.info(f"✓ Found in Immich and checked: {checked}")
+        logger.info(f"⏭️  Not found in Immich: {not_found}")
+        logger.info(f"⏭️  Skipped (no filename): {skipped}")
         
         if dry_run:
             logger.info(f"🔍 Would repair: {needs_repair}")

@@ -100,11 +100,6 @@ class ProcessOnlyRequest(BaseModel):
     immich_url: Optional[str] = None
     api_key: Optional[str] = None
 
-
-class TestConnectionRequest(BaseModel):
-    immich_url: str
-    api_key: str
-
 # Ensure directories exist
 UPLOAD_DIR = Path("./uploads")
 WORK_DIR = Path("./work")
@@ -145,37 +140,6 @@ async def upload_file(file: UploadFile = File(...)):
     except Exception as e:
         logger.error(f"Upload failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/upload/metadata")
-async def upload_metadata_file(file: UploadFile = File(...)):
-    """Upload metadata JSON file to work directory"""
-    try:
-        # Validate file type
-        if not file.filename.endswith('.json'):
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid file type. Please upload a .json file"
-            )
-        
-        # Save uploaded file to work directory
-        file_path = WORK_DIR / file.filename
-        with open(file_path, 'wb') as f:
-            content = await file.read()
-            f.write(content)
-        
-        logger.info(f"Uploaded metadata file: {file.filename} ({len(content)} bytes)")
-        
-        return {
-            "status": "success",
-            "filename": file.filename,
-            "size": len(content),
-            "path": str(file_path)
-        }
-    
-    except Exception as e:
-        logger.error(f"Metadata upload failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/api/import/start")
 async def start_import(
@@ -679,103 +643,6 @@ async def start_process_only(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/metadata/list")
-
-@app.post("/api/repair/test-connection")
-async def test_immich_connection(request: TestConnectionRequest):
-    """Test Immich API connection"""
-    try:
-        import requests
-        
-        # Ensure URL ends with /api
-        url = request.immich_url.rstrip('/')
-        if not url.endswith('/api'):
-            url = f"{url}/api"
-        
-        headers = {
-            'x-api-key': request.api_key,
-            'Accept': 'application/json',
-            'Content-Type': 'application/json'
-        }
-        
-        # Try to access server/version endpoint to verify connection and API key
-        # This endpoint verifies both connection and authentication
-        response = requests.get(
-            f"{url}/server/version",
-            headers=headers,
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            # Connection successful - get server version info
-            try:
-                version_data = response.json()
-                major = version_data.get('major', '?')
-                minor = version_data.get('minor', '?')
-                patch = version_data.get('patch', '?')
-                version_str = f"{major}.{minor}.{patch}"
-                message = f"Successfully connected to Immich (Version: {version_str})"
-            except:
-                # Fallback: try ping endpoint if version parsing fails
-                ping_response = requests.get(
-                    f"{url}/server/ping",
-                    headers=headers,
-                    timeout=10
-                )
-                if ping_response.status_code == 200:
-                    message = "Successfully connected to Immich"
-                    version_str = None
-                else:
-                    raise Exception("Could not verify connection")
-            
-            # Try to get user info for better feedback (optional, don't fail if unavailable)
-            user_email = "user"
-            try:
-                user_response = requests.get(
-                    f"{url}/user/me",
-                    headers=headers,
-                    timeout=10
-                )
-                if user_response.status_code == 200:
-                    user_data = user_response.json()
-                    user_email = user_data.get('email', user_data.get('name', 'user'))
-            except:
-                pass  # User endpoint might not be available, but connection works
-            
-            result = {
-                "status": "success",
-                "connected": True,
-                "user": user_email,
-                "message": message
-            }
-            if 'version_str' in locals() and version_str:
-                result["version"] = version_str
-            return result
-        elif response.status_code == 401:
-            return {
-                "status": "error",
-                "connected": False,
-                "message": "Authentication failed. Please check your API key."
-            }
-        else:
-            return {
-                "status": "error",
-                "connected": False,
-                "message": f"Connection failed: {response.status_code} - {response.text[:100]}"
-            }
-    
-    except requests.exceptions.ConnectionError:
-        return {
-            "status": "error",
-            "connected": False,
-            "message": "Cannot connect to Immich server. Please check the URL."
-        }
-    except Exception as e:
-        logger.error(f"Connection test failed: {e}")
-        return {
-            "status": "error",
-            "connected": False,
-            "message": f"Connection test failed: {str(e)}"
-        }
 async def list_metadata_files():
     """List available metadata files"""
     try:
@@ -1235,40 +1102,15 @@ def get_main_html():
                     </p>
                     
                     <div class="form-group">
-                        <label>Metadata JSON File</label>
-                        <div style="margin-bottom: 10px;">
-                            <div class="upload-area" id="repairUploadArea" style="padding: 20px; cursor: pointer;">
-                                <div class="upload-icon">📁</div>
-                                <p style="margin-bottom: 8px;">
-                                    <strong>Drag & drop JSON metadata file here</strong>
-                                </p>
-                                <p style="color: #666; font-size: 14px;">
-                                    or click to browse
-                                </p>
-                                <input type="file" id="repairFileInput" accept=".json" style="display: none;">
-                            </div>
-                        </div>
-                        <p style="text-align: center; color: #666; margin: 10px 0;">OR</p>
+                        <label for="repairMetadataFile">Metadata JSON File</label>
                         <select id="repairMetadataFile">
-                            <option value="">-- Select existing metadata file --</option>
+                            <option value="">-- Select metadata file --</option>
                         </select>
-                        <div id="repairMetadataStatus" style="margin-top: 10px; display: none;" class="status-indicator">
-                            <span id="repairMetadataStatusIcon" class="status-icon"></span>
-                            <span id="repairMetadataStatusText"></span>
-                        </div>
-                        <div id="repairUploadedFile" style="margin-top: 10px; display: none; padding: 10px; background: #d4edda; border: 1px solid #c3e6cb; border-radius: 8px; color: #155724;">
-                            <strong>✓ Metadata file uploaded:</strong> <span id="repairFileName"></span>
-                        </div>
                     </div>
                     
                     <div class="form-group">
                         <label for="repairImmichUrl">Immich Server URL</label>
-                        <div style="display: flex; gap: 10px;">
-                            <input type="text" id="repairImmichUrl" placeholder="http://localhost:2283/api" style="flex: 1;">
-                            <button class="btn" id="testConnectionBtn" style="flex: 0 0 auto; width: auto; padding: 12px 20px;">
-                                Test Connection
-                            </button>
-                        </div>
+                        <input type="text" id="repairImmichUrl" placeholder="http://localhost:2283/api">
                     </div>
                     
                     <div class="form-group">
@@ -1276,29 +1118,20 @@ def get_main_html():
                         <input type="password" id="repairApiKey" placeholder="Your API key">
                     </div>
                     
-                    <div id="repairConnectionStatus" style="margin-bottom: 20px; display: none;" class="status-indicator">
-                        <span id="repairConnectionStatusIcon" class="status-icon"></span>
-                        <span id="repairConnectionStatusText"></span>
-                    </div>
-                    
                     <div style="display: flex; gap: 10px;">
-                        <button class="btn" id="checkMetadataBtn" style="flex: 1;" disabled>
+                        <button class="btn" id="checkMetadataBtn" style="flex: 1;">
                             Check Metadata (Dry Run)
                         </button>
-                        <button class="btn" id="applyFixesBtn" style="flex: 1;" disabled>
+                        <button class="btn" id="applyFixesBtn" style="flex: 1;">
                             Apply Fixes
                         </button>
                     </div>
-
                 </div>
                 
                 <div class="progress-section" id="repairProgressSection">
                     <div class="section-title">Repair Progress</div>
                     <div class="progress-bar-container">
                         <div class="progress-bar" id="repairProgressBar" style="width: 0%">0%</div>
-                    </div>
-                    <div style="margin-top: 10px; text-align: center; color: #666; font-size: 13px; font-weight: 500;">
-                        <span id="repairProgressDetails">Ready to start...</span>
                     </div>
                     <div id="repairStatusMessages"></div>
                     <div id="repairStatsSection" style="display: none;">
@@ -1438,7 +1271,7 @@ def get_main_html():
             
             if (data.type === 'progress') {
                 if (jobType === 'repair') {
-                    updateRepairProgress(data.progress, data.message, data.details || null);
+                    updateRepairProgress(data.progress, data.message);
                 } else if (jobType === 'process') {
                     updateProcessProgress(data.progress, data.message);
                 } else {
@@ -1446,7 +1279,7 @@ def get_main_html():
                 }
             } else if (data.type === 'complete') {
                 if (jobType === 'repair') {
-                    updateRepairProgress(100, data.message, data.stats || null);
+                    updateRepairProgress(100, data.message);
                     if (data.stats) {
                         displayRepairStats(data.stats);
                     }
@@ -1640,13 +1473,12 @@ def get_main_html():
         document.getElementById('applyFixesBtn').addEventListener('click', () => startRepair(false));
         
         async function startRepair(dryRun) {
-            // Check both uploaded file and selected file from dropdown
-            const metadataFile = repairMetadataFilename || document.getElementById('repairMetadataFile')?.value;
+            const metadataFile = document.getElementById('repairMetadataFile').value;
             const immichUrl = document.getElementById('repairImmichUrl').value;
             const apiKey = document.getElementById('repairApiKey').value;
             
             if (!metadataFile) {
-                alert('Please select or upload a metadata file');
+                alert('Please select a metadata file');
                 return;
             }
             
@@ -1659,11 +1491,7 @@ def get_main_html():
                 document.getElementById('repairProgressSection').classList.add('active');
                 document.getElementById('repairStatusMessages').innerHTML = '';
                 document.getElementById('repairStatsSection').style.display = 'none';
-                const progressDetails = document.getElementById('repairProgressDetails');
-                if (progressDetails) {
-                    progressDetails.textContent = 'Initializing repair job...';
-                }
-                updateRepairProgress(0, dryRun ? 'Starting dry run...' : 'Starting repair...', null);
+                updateRepairProgress(0, dryRun ? 'Starting dry run...' : 'Starting repair...');
                 
                 const response = await fetch('/api/repair/start', {
                     method: 'POST',
@@ -1688,6 +1516,14 @@ def get_main_html():
             }
         }
         
+        function updateRepairProgress(percent, message) {
+            const progressBar = document.getElementById('repairProgressBar');
+            progressBar.style.width = `${percent}%`;
+            progressBar.textContent = `${percent}%`;
+            
+            if (message) {
+                addRepairStatusMessage('info', message);
+            }
         }
         
         function addRepairStatusMessage(type, message) {
@@ -1734,7 +1570,7 @@ def get_main_html():
             const apiKey = document.getElementById('processApiKey').value;
             
             if (!metadataFile) {
-                alert('Please select or upload a metadata file');
+                alert('Please select a metadata file');
                 return;
             }
             
@@ -1815,199 +1651,7 @@ def get_main_html():
             statsGrid.appendChild(card);
         }
         
-        // Repair Immich file upload handlers
-        let repairMetadataFilename = null;
-        let repairConnectionStatus = false;
-        let repairMetadataReady = false;
-        
-        function showRepairMetadataStatus(type, message) {
-            const statusDiv = document.getElementById('repairMetadataStatus');
-            if (!statusDiv) return;
-            const iconSpan = document.getElementById('repairMetadataStatusIcon');
-            const textSpan = document.getElementById('repairMetadataStatusText');
-            statusDiv.style.display = 'flex';
-            statusDiv.className = `status-indicator ${type}`;
-            if (iconSpan) iconSpan.textContent = type === 'success' ? '✓' : type === 'error' ? '❌' : '⏳';
-            if (textSpan) textSpan.textContent = message;
-        }
-        
-        function showRepairConnectionStatus(type, message) {
-            const statusDiv = document.getElementById('repairConnectionStatus');
-            if (!statusDiv) return;
-            const iconSpan = document.getElementById('repairConnectionStatusIcon');
-            const textSpan = document.getElementById('repairConnectionStatusText');
-            statusDiv.style.display = 'flex';
-            statusDiv.className = `status-indicator ${type}`;
-            if (iconSpan) iconSpan.textContent = type === 'success' ? '✓' : type === 'error' ? '❌' : '⏳';
-            if (textSpan) textSpan.textContent = message;
-        }
-        
-        function checkRepairReady() {
-            const metadataFile = repairMetadataFilename || document.getElementById('repairMetadataFile')?.value;
-            const hasMetadata = !!metadataFile;
-            repairMetadataReady = hasMetadata;
-            const isReady = repairConnectionStatus && repairMetadataReady;
-            const checkBtn = document.getElementById('checkMetadataBtn');
-            const applyBtn = document.getElementById('applyFixesBtn');
-            if (checkBtn) checkBtn.disabled = !isReady;
-            if (applyBtn) applyBtn.disabled = !isReady;
-        }
-        
-        const repairUploadArea = document.getElementById('repairUploadArea');
-        const repairFileInput = document.getElementById('repairFileInput');
-        
-        if (repairUploadArea && repairFileInput) {
-            repairUploadArea.addEventListener('click', () => repairFileInput.click());
-            repairUploadArea.addEventListener('dragover', (e) => {
-                e.preventDefault();
-                repairUploadArea.classList.add('dragging');
-            });
-            repairUploadArea.addEventListener('dragleave', () => {
-                repairUploadArea.classList.remove('dragging');
-            });
-            repairUploadArea.addEventListener('drop', async (e) => {
-                e.preventDefault();
-                repairUploadArea.classList.remove('dragging');
-                const file = e.dataTransfer.files[0];
-                if (file) await handleRepairMetadataUpload(file);
-            });
-        }
-        
-        if (repairFileInput) {
-            repairFileInput.addEventListener('change', async (e) => {
-                const file = e.target.files[0];
-                if (file) await handleRepairMetadataUpload(file);
-            });
-        }
-        
-        async function handleRepairMetadataUpload(file) {
-            if (!file.name.endsWith('.json')) {
-                showRepairMetadataStatus('error', '❌ Please upload a JSON file');
-                return;
-            }
-            
-            const formData = new FormData();
-            formData.append('file', file);
-            
-            try {
-                showRepairMetadataStatus('info', '⏳ Uploading metadata file...');
-                
-                const response = await fetch('/api/upload/metadata', {
-                    method: 'POST',
-                    body: formData
-                });
-                
-                if (!response.ok) {
-                    const errorData = await response.json().catch(() => ({detail: 'Upload failed'}));
-                    throw new Error(errorData.detail || 'Upload failed');
-                }
-                
-                const data = await response.json();
-                repairMetadataFilename = data.filename;
-                const fileNameEl = document.getElementById('repairFileName');
-                const uploadedFileEl = document.getElementById('repairUploadedFile');
-                const metadataSelect = document.getElementById('repairMetadataFile');
-                
-                if (fileNameEl) fileNameEl.textContent = data.filename;
-                if (uploadedFileEl) uploadedFileEl.style.display = 'block';
-                if (metadataSelect) metadataSelect.value = '';
-                
-                showRepairMetadataStatus('success', `✓ Metadata file uploaded successfully: ${data.filename} (${(data.size / 1024).toFixed(1)} KB)`);
-                checkRepairReady();
-            } catch (error) {
-                showRepairMetadataStatus('error', `❌ Upload failed: ${error.message}`);
-            }
-        }
-        
-        // Test connection button handler
-        const testConnectionBtn = document.getElementById('testConnectionBtn');
-        if (testConnectionBtn) {
-            testConnectionBtn.addEventListener('click', async () => {
-                const immichUrl = document.getElementById('repairImmichUrl').value;
-                const apiKey = document.getElementById('repairApiKey').value;
-                
-                if (!immichUrl || !apiKey) {
-                    showRepairConnectionStatus('error', '❌ Please enter Immich URL and API key');
-                    repairConnectionStatus = false;
-                    checkRepairReady();
-                    return;
-                }
-                
-                try {
-                    showRepairConnectionStatus('info', '⏳ Testing connection...');
-                    testConnectionBtn.disabled = true;
-                    
-                    const response = await fetch('/api/repair/test-connection', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({
-                            immich_url: immichUrl,
-                            api_key: apiKey
-                        })
-                    });
-                    
-                    const data = await response.json();
-                    
-                    if (data.connected) {
-                        showRepairConnectionStatus('success', `✓ Connected to Immich as ${data.user || 'user'}`);
-                        repairConnectionStatus = true;
-                    } else {
-                        showRepairConnectionStatus('error', `❌ ${data.message || 'Connection failed'}`);
-                        repairConnectionStatus = false;
-                    }
-                    
-                    checkRepairReady();
-                } catch (error) {
-                    showRepairConnectionStatus('error', `❌ Connection test failed: ${error.message}`);
-                    repairConnectionStatus = false;
-                    checkRepairReady();
-                } finally {
-                    testConnectionBtn.disabled = false;
-                }
-            });
-        }
-        
-        // Monitor URL and API key changes to auto-test connection
-        const repairImmichUrlInput = document.getElementById('repairImmichUrl');
-        const repairApiKeyInput = document.getElementById('repairApiKey');
-        
-        if (repairImmichUrlInput) {
-            repairImmichUrlInput.addEventListener('blur', function() {
-                const apiKey = repairApiKeyInput?.value || '';
-                if (this.value && apiKey && this.value.trim() && testConnectionBtn) {
-                    testConnectionBtn.click();
-                }
-            });
-        }
-        
-        if (repairApiKeyInput) {
-            repairApiKeyInput.addEventListener('blur', function() {
-                const immichUrl = repairImmichUrlInput?.value || '';
-                if (immichUrl && this.value && immichUrl.trim() && testConnectionBtn) {
-                    testConnectionBtn.click();
-                }
-            });
-        }
-        
-        // Add change handler for repair metadata select
-        const repairMetadataSelect = document.getElementById('repairMetadataFile');
-        if (repairMetadataSelect) {
-            repairMetadataSelect.addEventListener('change', function() {
-                if (this.value) {
-                    repairMetadataFilename = null;
-                    const uploadedFileEl = document.getElementById('repairUploadedFile');
-                    if (uploadedFileEl) uploadedFileEl.style.display = 'none';
-                    showRepairMetadataStatus('success', `✓ Selected metadata file: ${this.value}`);
-                    checkRepairReady();
-                } else {
-                    const statusDiv = document.getElementById('repairMetadataStatus');
-                    if (statusDiv) statusDiv.style.display = 'none';
-                    checkRepairReady();
-                }
-            });
-        }
-        
-                // Load config on page load
+        // Load config on page load
         fetch('/api/config')
             .then(r => r.json())
             .then(config => {
