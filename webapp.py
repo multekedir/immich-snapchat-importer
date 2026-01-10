@@ -6,6 +6,7 @@ Provides a user-friendly web UI with improved progress tracking
 
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, BackgroundTasks, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional
 import asyncio
@@ -34,12 +35,23 @@ from repair_immich_metadata import ImmichMetadataRepairer
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Ensure directories exist BEFORE creating app
+UPLOAD_DIR = Path("./uploads")
+WORK_DIR = Path("./work")
+STATIC_DIR = Path("./static")
+UPLOAD_DIR.mkdir(exist_ok=True)
+WORK_DIR.mkdir(exist_ok=True)
+STATIC_DIR.mkdir(exist_ok=True)
+
 # Create FastAPI app
 app = FastAPI(
     title="Immich Snapchat Importer",
     description="Import Snapchat Memories to Immich with metadata preservation",
     version="2.0.0"
 )
+
+# Mount static files directory
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # Global state management
 class ImportState:
@@ -92,12 +104,6 @@ class ProcessOnlyRequest(BaseModel):
 class TestConnectionRequest(BaseModel):
     immich_url: str
     api_key: str
-
-# Ensure directories exist
-UPLOAD_DIR = Path("./uploads")
-WORK_DIR = Path("./work")
-UPLOAD_DIR.mkdir(exist_ok=True)
-WORK_DIR.mkdir(exist_ok=True)
 
 @app.get("/", response_class=HTMLResponse)
 async def root():

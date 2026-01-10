@@ -902,22 +902,8 @@ async function loadConfig() {
     }
 }
 
-// Initialize tab button handlers
-function initTabHandlers() {
-    const tabButtons = document.querySelectorAll('.tab-button');
-    tabButtons.forEach(button => {
-        button.addEventListener('click', function() {
-            const tabName = this.getAttribute('data-tab');
-            if (tabName) {
-                switchTab(tabName, this);
-            }
-        });
-    });
-}
-
 // Initialize all handlers on page load
 document.addEventListener('DOMContentLoaded', function() {
-    initTabHandlers();
     initUploadHandlers();
     initImportButton();
     initRepairHandlers();

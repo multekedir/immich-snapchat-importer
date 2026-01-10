@@ -610,6 +610,13 @@ async function startRepair(dryRun) {
         return;
     }
     
+    // Ensure function is defined before calling
+    if (typeof updateRepairProgress !== 'function') {
+        console.error('updateRepairProgress is not defined. Script may not have loaded correctly.');
+        alert('Error: JavaScript functions not loaded. Please refresh the page.');
+        return;
+    }
+    
     try {
         document.getElementById('repairProgressSection').classList.add('active');
         document.getElementById('repairStatusMessages').innerHTML = '';
